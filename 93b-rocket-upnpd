@@ -1,0 +1,29 @@
+#!/bin/sh
+# 93b-rocket-upnpd — Rocket Routers v2.5.6
+# Enable miniUPnP for automatic port mapping (gaming, P2P, voip etc.)
+
+uci -q batch <<'UCIEOF'
+set upnpd.config=upnpd
+set upnpd.config.enabled='1'
+set upnpd.config.enable_natpmp='1'
+set upnpd.config.enable_upnp='1'
+set upnpd.config.log_output='0'
+set upnpd.config.igdv1='1'
+set upnpd.config.upnp_lease_file='/var/run/upnp.leases'
+del upnpd.config.listen_interface
+add_list upnpd.config.listen_interface='br-lan'
+set upnpd.config.wan_interface='4_1'
+set upnpd.config.allow_private_ipv4='1'
+commit upnpd
+UCIEOF
+
+/etc/init.d/miniupnpd enable 2>/dev/null
+
+# Fix DHCPv4 conflict — remove odhcpd as DHCPv4 server, let dnsmasq handle it
+uci -q delete dhcp.lan.dhcpv4
+
+# Explicitly advertise correct gateway via DHCP
+uci -q del_list dhcp.lan.dhcp_option='3,192.168.1.1'
+uci -q add_list dhcp.lan.dhcp_option='3,192.168.1.1'
+uci commit dhcp
+exit 0

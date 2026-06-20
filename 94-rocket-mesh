@@ -1,0 +1,53 @@
+#!/bin/sh
+# /etc/uci-defaults/94-rocket-mesh
+# Mycelium Mesh RocketRouters - 802.11s open mesh (backhaul) interface
+#
+# Adds a second wifi-iface on radio1 (5 GHz) running mode='mesh'. This is the
+# open IEEE 802.11s standard - any 802.11s-capable router can join (Rocket
+# Plus + Pro talk to each other; third-party 802.11s gear like other OpenWrt
+# boxes, GL.iNet routers, etc. can also join). It is NOT compatible with
+# proprietary mesh (TP-Link OneMesh, Asus AiMesh, Eero, Deco) - those are
+# vendor-locked.
+#
+# Mesh runs alongside the AP on the same 5 GHz radio (single-radio mesh -
+# slightly halves throughput vs dedicated backhaul, but uses no extra RF).
+# Customers with two Rockets within range get auto-formed backhaul; clients
+# still associate to the AP as normal.
+#
+# Mesh ID is the L2 identifier (like SSID) - all Rockets share it so they
+# see each other. Mesh PSK uses SAE (WPA3) for the link encryption.
+
+set -e
+LOGTAG="rocket-mesh"
+logger -t "$LOGTAG" "v2.5.5 802.11s mesh setup"
+
+MESH_ID='rocketmesh7'
+MESH_KEY='Opennowplease123@'    # any Rocket joining the mesh needs this key
+
+# Only attach mesh to radio1 (5 GHz) if it exists. 2.4 GHz mesh is too slow
+# for a useful backhaul; 6 GHz mesh has client compatibility issues.
+if uci -q get wireless.radio1 >/dev/null 2>&1; then
+    # Check if rocket_mesh interface already configured (idempotent)
+    if ! uci -q get wireless.rocket_mesh >/dev/null 2>&1; then
+        uci -q batch <<EOF
+set wireless.rocket_mesh=wifi-iface
+set wireless.rocket_mesh.device='radio1'
+set wireless.rocket_mesh.network='lan'
+set wireless.rocket_mesh.mode='mesh'
+set wireless.rocket_mesh.mesh_id='$MESH_ID'
+set wireless.rocket_mesh.mesh_fwding='1'
+set wireless.rocket_mesh.encryption='sae'
+set wireless.rocket_mesh.key='$MESH_KEY'
+set wireless.rocket_mesh.disabled='0'
+commit wireless
+EOF
+        logger -t "$LOGTAG" "Mesh interface added on radio1 (mesh_id=$MESH_ID)"
+    else
+        logger -t "$LOGTAG" "Mesh interface already exists - skipping"
+    fi
+else
+    logger -t "$LOGTAG" "radio1 not present - skipping mesh setup"
+fi
+
+wifi reload >/dev/null 2>&1 || true
+exit 0

@@ -1,0 +1,16 @@
+#!/bin/sh
+# /etc/uci-defaults/96-rocket-dns
+# Rocket Routers Firmware — bake DNS resolvers into dnsmasq config.
+# Runs once on first boot. Sets 8.8.8.8 + 8.8.4.4 as upstream DNS.
+# Survives sysupgrade -n (config wipe) because it re-runs as a uci-default.
+
+LOGTAG="rocket-dns-defaults"
+logger -t "$LOGTAG" "Setting upstream DNS resolvers"
+
+uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
+uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
+uci add_list dhcp.@dnsmasq[0].server='8.8.4.4'
+uci commit dhcp
+
+logger -t "$LOGTAG" "DNS defaults applied: 8.8.8.8, 8.8.4.4"
+exit 0

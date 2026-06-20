@@ -1,0 +1,69 @@
+#!/bin/sh
+# /etc/uci-defaults/92-rocket-pin-modem
+# Mycelium Mesh RocketRouters - persistent qmodem at_port pin
+#
+# WHY THIS EXISTS:
+# qmodem stack (modem_scan.sh / vendor/quectel.sh) auto-detects AT ports at
+# boot and rewrites /etc/config/qmodem with whatever it finds first. On the
+# RM500U-EA it tends to pick /dev/ttyUSB3, which echoes 'AT' but never
+# responds - empties Modem Info widget signal fields, makes ubus at-daemon
+# sendat time out, and breaks the LuCI Modem panel.
+#
+# SOLUTION:
+# Drop a small loop script that re-pins at_port=/dev/ttyUSB2 a few times
+# after qmodem services settle, and an init.d wrapper that runs it at every
+# boot (background, non-blocking).
+#
+# v3.4.0 fix: REMOVED procd respawn. Old version used procd_set_param respawn
+# which caused procd to restart the script every time it exited cleanly — the
+# loop was firing every ~90 seconds forever. Now uses a plain sh start()
+# function that runs the loop once in the background and exits. Stays dead.
+
+LOGTAG="rocket-pin-modem-defaults"
+logger -t "$LOGTAG" "v3.4.0 installing modem at_port pin loop"
+
+# ---------------------------------------------------------------------------
+# 1. Pin loop script (runs once per boot, 5 retries over ~70s, then exits)
+# ---------------------------------------------------------------------------
+cat > /etc/rocket-pin-modem.sh <<'PINEOF'
+#!/bin/sh
+# Re-pin qmodem at_port to /dev/ttyUSB2 after qmodem stack settles.
+# Loops 5x because modem_scan can rewrite config asynchronously.
+# Runs ONCE at boot then exits — init.d does NOT respawn it.
+sleep 30
+for n in 1 2 3 4 5; do
+    for SECT in $(uci -q show qmodem | awk -F'[.=]' '/=modem-device$/{print $2}'); do
+        uci -q set qmodem.${SECT}.at_port='/dev/ttyUSB2'
+        uci -q set qmodem.${SECT}.valid_at_ports='/dev/ttyUSB2'
+    done
+    uci -q commit qmodem
+    sleep 8
+done
+logger -t rocket-pin-modem "AT port pin complete — ttyUSB2 locked"
+PINEOF
+chmod +x /etc/rocket-pin-modem.sh
+
+# ---------------------------------------------------------------------------
+# 2. Init.d service — plain sh start(), NO procd, NO respawn
+#    START=99: runs after all qmodem services have registered
+# ---------------------------------------------------------------------------
+cat > /etc/init.d/rocket-pin-modem <<'INITEOF'
+#!/bin/sh /etc/rc.common
+# Rocket Routers - re-pin qmodem at_port at every boot (oneshot, no respawn)
+START=99
+STOP=10
+
+start() {
+    # Run in background — the 70s loop must not block boot
+    /etc/rocket-pin-modem.sh &
+}
+INITEOF
+chmod +x /etc/init.d/rocket-pin-modem
+/etc/init.d/rocket-pin-modem enable
+
+# Also kick it off on this first boot (enable only creates the rc.d symlink
+# for NEXT boot — without this the pin loop doesn't fire on first boot)
+/etc/rocket-pin-modem.sh &
+
+logger -t "$LOGTAG" "v3.4.0 modem pin loop installed (oneshot, no respawn)"
+exit 0

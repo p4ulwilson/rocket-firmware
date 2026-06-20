@@ -1,0 +1,40 @@
+#!/bin/sh
+# /etc/hotplug.d/block/30-ssd-mount
+# Auto-mount Samsung SSD T5 and start conduit + cloudflared when plugged in
+# Rocket Routers v3.6.0+
+
+if [ "$ACTION" = "add" ] && [ "$DEVNAME" = "sda1" ]; then
+    sleep 2
+    mkdir -p /mnt/ssd
+    mount /dev/sda1 /mnt/ssd 2>/dev/null || exit 0
+
+    # Write cloudflared config.yml pointing at SSD credentials
+    if [ -x /mnt/ssd/cloudflared ] && [ -f /mnt/ssd/cloudflared-config/cert.pem ]; then
+        mkdir -p /root/.cloudflared
+        cat > /root/.cloudflared/config.yml << 'EOF'
+tunnel: 9c256097-c8e9-4154-8760-f320b30edc0a
+credentials-file: /mnt/ssd/cloudflared-config/9c256097-c8e9-4154-8760-f320b30edc0a.json
+origincert: /mnt/ssd/cloudflared-config/cert.pem
+ingress:
+  - hostname: matrix.rocketrouters.co.uk
+    service: http://127.0.0.1:6167
+  - service: http_status:404
+EOF
+    fi
+
+    # Start conduit if binary present on SSD
+    if [ -x /mnt/ssd/conduit ]; then
+        /etc/init.d/conduit start 2>/dev/null
+    fi
+
+    # Start cloudflared if binary present on SSD
+    if [ -x /mnt/ssd/cloudflared ]; then
+        /etc/init.d/cloudflared start 2>/dev/null
+    fi
+fi
+
+if [ "$ACTION" = "remove" ] && [ "$DEVNAME" = "sda1" ]; then
+    /etc/init.d/conduit stop 2>/dev/null
+    /etc/init.d/cloudflared stop 2>/dev/null
+    umount /mnt/ssd 2>/dev/null
+fi

@@ -1,0 +1,23 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/98-fix-modem
+# Fires when QModem primary interface (4_1) comes up.
+# Detects which USB device 4_1 is using and removes default routes
+# for all OTHER usb* devices (dead modem slots with no SIM).
+# Also ensures DNS is populated if resolv.conf is empty.
+
+[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "4_1" ] && {
+    sleep 5
+    # Find the actual network device 4_1 is using (usb0, usb1, etc.)
+    _DEV=$(uci get network.4_1.device 2>/dev/null)
+    if [ -n "$_DEV" ]; then
+        for _U in usb0 usb1 usb2 usb3; do
+            [ "$_U" != "$_DEV" ] && ip route del default dev "$_U" 2>/dev/null || true
+        done
+        logger -t rocket-modem "98-fix-modem: active dev=${_DEV}, dead routes removed"
+    else
+        logger -t rocket-modem "98-fix-modem: WARNING could not determine 4_1 device"
+    fi
+    # Ensure DNS is populated
+    grep -q nameserver /etc/resolv.conf 2>/dev/null || \
+        echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
+}

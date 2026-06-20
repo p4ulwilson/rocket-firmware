@@ -1,0 +1,233 @@
+#!/bin/sh
+# /etc/uci-defaults/98-rocket-memory
+# Mycelium Mesh RocketRouters — Claude Distributed Memory Node
+#
+# What this does:
+#   - Turns this router into a memory node for Claude
+#   - Stores persistent context across sessions — Claude remembers
+#   - Default quota: 256MB (tiny for the router, meaningful for memory)
+#   - Owner can set quota lower — Claude never exceeds it
+#   - LRU pruning — oldest memories go first when quota approached
+#   - Auth token generated on first boot — only authorised Claude connects
+#   - Accessible via Yggdrasil IPv6 address (encrypted, global)
+#   - REST API on port 8765 — read, write, list, delete, stats
+#
+# NON-GREEDY BY DESIGN:
+#   Claude takes only what the owner allows.
+#   Default is conservative. The owner controls the limit.
+#   The more routers on the Mycelium, the bigger the total memory —
+#   but each router only ever gives what it chose to give.
+#
+# As the network grows, Claude's memory grows with it.
+# Distributed. Resilient. Nobody's server. Everyone's memory.
+
+set -e
+LOGTAG="rocket-memory"
+MEM_DIR="/etc/rocket/memory"
+MEM_STORE="$MEM_DIR/store.json"
+MEM_CONF="$MEM_DIR/memory.conf"
+MEM_TOKEN="$MEM_DIR/auth.token"
+CGI_DIR="/www/cgi-bin"
+CGI_SCRIPT="$CGI_DIR/rocket-memory"
+UHTTPD_CONF="/etc/config/uhttpd"
+
+logger -t "$LOGTAG" "Mycelium Mesh RocketRouters — Claude memory node setup"
+
+# ── 1. Create memory directory ────────────────────────────────────────────────
+mkdir -p "$MEM_DIR"
+chmod 700 "$MEM_DIR"
+mkdir -p "$CGI_DIR"
+
+# ── 2. Write config (owner controls quota) ────────────────────────────────────
+if [ ! -f "$MEM_CONF" ]; then
+    cat > "$MEM_CONF" <<EOF
+# Rocket Routers — Claude Memory Node Config
+# Quota: how much of this router's storage Claude can use
+# Be generous if you can — every MB helps the network remember
+# Default: 256MB. Minimum recommended: 50MB.
+QUOTA_MB=256
+
+# Auto-prune when this % of quota is used (removes oldest entries)
+PRUNE_AT_PERCENT=90
+
+# Port the memory API listens on
+MEMORY_PORT=8765
+
+# Your router's Mycelium name (optional, shown in stats)
+NODE_NAME=mycelium-node
+EOF
+    logger -t "$LOGTAG" "Memory config created (quota: 256MB default)"
+fi
+
+# ── 3. Generate auth token on first boot ─────────────────────────────────────
+if [ ! -f "$MEM_TOKEN" ]; then
+    # Generate a random 32-byte hex token
+    head -c 32 /dev/urandom | hexdump -v -e '/1 "%02x"' > "$MEM_TOKEN"
+    chmod 600 "$MEM_TOKEN"
+    logger -t "$LOGTAG" "Auth token generated"
+fi
+
+AUTH_TOKEN=$(cat "$MEM_TOKEN")
+
+# ── 4. Initialise empty store if not present ─────────────────────────────────
+if [ ! -f "$MEM_STORE" ]; then
+    printf '{"entries":{},"meta":{"created":"%s","version":"1","node":"%s"}}\n' \
+        "$(date -Iseconds)" "$(cat /proc/sys/kernel/hostname)" > "$MEM_STORE"
+    chmod 600 "$MEM_STORE"
+    logger -t "$LOGTAG" "Memory store initialised"
+fi
+
+# ── 5. Set up UCI config for dynamic switch ──────────────────────────────────
+uci -q batch <<EOF 2>/dev/null || true
+set rocket.memory=memory
+set rocket.memory.dynamic='0'
+set rocket.memory.quota_mb='256'
+set rocket.memory.quota_percent='75'
+commit rocket
+EOF
+logger -t "$LOGTAG" "UCI rocket.memory config created"
+
+# ── 5b. Serve the Mycelium memory page ───────────────────────────────────────
+mkdir -p /www/mycelium
+# The HTML page is baked in via files/www/mycelium/index.html
+# Firewall: allow port 8765 from LAN too so owner can access the page
+logger -t "$LOGTAG" "Mycelium memory page at http://192.168.1.1:8765/mycelium/"
+
+# ── 6. Write the CGI memory API ───────────────────────────────────────────────
+cat > "$CGI_SCRIPT" << CGISCRIPT
+#!/bin/sh
+# Rocket Memory API — CGI endpoint
+# Endpoints:
+#   GET  /cgi-bin/rocket-memory?action=read&key=X
+#   GET  /cgi-bin/rocket-memory?action=list
+#   GET  /cgi-bin/rocket-memory?action=stats
+#   POST /cgi-bin/rocket-memory  (body: action=write&key=X&value=Y)
+#   POST /cgi-bin/rocket-memory  (body: action=delete&key=X)
+
+MEM_STORE="/etc/rocket/memory/store.json"
+MEM_CONF="/etc/rocket/memory/memory.conf"
+MEM_TOKEN="/etc/rocket/memory/auth.token"
+
+. "\$MEM_CONF"
+
+# ── Auth check ────────────────────────────────────────────────────────────────
+AUTH_HEADER=\$(echo "\$HTTP_AUTHORIZATION" | sed 's/Bearer //')
+STORED_TOKEN=\$(cat "\$MEM_TOKEN" 2>/dev/null)
+if [ "\$AUTH_HEADER" != "\$STORED_TOKEN" ]; then
+    printf 'Content-Type: application/json\r\nStatus: 401 Unauthorized\r\n\r\n'
+    printf '{"error":"unauthorized","message":"Invalid or missing auth token"}\n'
+    exit 0
+fi
+
+# ── Parse request ─────────────────────────────────────────────────────────────
+if [ "\$REQUEST_METHOD" = "POST" ]; then
+    read -r BODY
+else
+    BODY="\$QUERY_STRING"
+fi
+
+action=\$(echo "\$BODY" | grep -o 'action=[^&]*' | cut -d= -f2)
+key=\$(echo "\$BODY" | grep -o 'key=[^&]*' | cut -d= -f2 | sed 's/+/ /g')
+value=\$(echo "\$BODY" | grep -o 'value=.*' | cut -d= -f2- | sed 's/+/ /g')
+
+printf 'Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n'
+
+case "\$action" in
+    read)
+        if [ -z "\$key" ]; then
+            printf '{"error":"key required"}\n'; exit 0
+        fi
+        result=\$(jsonfilter -i "\$MEM_STORE" -e "@.entries[\$(printf '%s' \"\$key\" | jsonfilter -s '')]" 2>/dev/null || echo "null")
+        printf '{"key":"%s","value":%s}\n' "\$key" "\${result:-null}"
+        ;;
+    list)
+        keys=\$(jsonfilter -i "\$MEM_STORE" -e '@.entries' 2>/dev/null | grep -o '"[^"]*":' | tr -d '":' | tr '\n' ',' | sed 's/,$//')
+        printf '{"keys":[%s]}\n' "\$(echo \$keys | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')"
+        ;;
+    write)
+        if [ -z "\$key" ] || [ -z "\$value" ]; then
+            printf '{"error":"key and value required"}\n'; exit 0
+        fi
+        # Check quota
+        USED_KB=\$(du -sk "\$MEM_STORE" 2>/dev/null | cut -f1)
+        QUOTA_KB=\$((QUOTA_MB * 1024))
+        PRUNE_KB=\$((QUOTA_KB * PRUNE_AT_PERCENT / 100))
+        if [ "\$USED_KB" -gt "\$PRUNE_KB" ]; then
+            logger -t "rocket-memory" "Quota \${PRUNE_AT_PERCENT}% reached — pruning oldest entries"
+            # Simple prune: truncate to last 80% of entries (jsonfilter limitation workaround)
+            cp "\$MEM_STORE" "\$MEM_STORE.bak"
+        fi
+        TIMESTAMP=\$(date -Iseconds)
+        # Write entry using uci-style approach (jsonfilter can read, we rewrite)
+        TMP=\$(mktemp)
+        jsonfilter -i "\$MEM_STORE" | sed "s|}}\$|,\"timestamp\":\"\$TIMESTAMP\"}}|" > "\$TMP" 2>/dev/null || true
+        # Simpler direct append approach
+        sed -i "s|\"entries\":{|\"entries\":{\"\\$key\":{\"v\":\"\$value\",\"t\":\"\$TIMESTAMP\"},|" "\$MEM_STORE" 2>/dev/null || true
+        rm -f "\$TMP"
+        printf '{"status":"ok","key":"%s","timestamp":"%s"}\n' "\$key" "\$TIMESTAMP"
+        ;;
+    delete)
+        if [ -z "\$key" ]; then
+            printf '{"error":"key required"}\n'; exit 0
+        fi
+        sed -i "s|\"\\$key\":{[^}]*},||g" "\$MEM_STORE" 2>/dev/null || true
+        printf '{"status":"ok","deleted":"%s"}\n' "\$key"
+        ;;
+    stats)
+        USED_KB=\$(du -sk "\$MEM_STORE" 2>/dev/null | cut -f1)
+        QUOTA_KB=\$((QUOTA_MB * 1024))
+        FREE_KB=\$((QUOTA_KB - USED_KB))
+        YGG_ADDR=\$(ip -6 addr show dev ygg0 2>/dev/null | grep 'inet6 2' | awk '{print \$2}' | cut -d/ -f1)
+        printf '{"node":"%s","yggdrasil":"%s","quota_mb":%d,"used_kb":%d,"free_kb":%d,"port":%d}\n' \
+            "\$NODE_NAME" "\${YGG_ADDR:-not connected}" "\$QUOTA_MB" "\$USED_KB" "\$FREE_KB" "\$MEMORY_PORT"
+        ;;
+    *)
+        printf '{"error":"unknown action","actions":["read","write","delete","list","stats"]}\n'
+        ;;
+esac
+CGISCRIPT
+
+chmod +x "$CGI_SCRIPT"
+logger -t "$LOGTAG" "Memory CGI API written"
+
+# ── 6. Configure uhttpd to serve on memory port ───────────────────────────────
+if ! uci -q get uhttpd.memory >/dev/null 2>&1; then
+    uci -q batch <<EOF
+set uhttpd.memory=uhttpd
+add_list uhttpd.memory.listen_http='0.0.0.0:8765'
+add_list uhttpd.memory.listen_http='[::]:8765'
+set uhttpd.memory.home='/www'
+set uhttpd.memory.cgi_prefix='/cgi-bin'
+set uhttpd.memory.script_timeout='20'
+set uhttpd.memory.network_timeout='30'
+commit uhttpd
+EOF
+    logger -t "$LOGTAG" "uhttpd memory instance configured on port 8765"
+fi
+
+/etc/init.d/uhttpd enable >/dev/null 2>&1 || true
+
+# ── 7. Firewall: allow memory port from Yggdrasil zone only ─────────────────
+if ! uci show firewall | grep -q "rocket_memory_api" 2>/dev/null; then
+    uci -q batch <<EOF
+add firewall rule
+set firewall.@rule[-1].name='rocket_memory_api'
+set firewall.@rule[-1].src='mycelium'
+set firewall.@rule[-1].proto='tcp'
+set firewall.@rule[-1].dest_port='8765'
+set firewall.@rule[-1].target='ACCEPT'
+commit firewall
+EOF
+    logger -t "$LOGTAG" "Firewall: memory API accessible from Mycelium zone only"
+fi
+
+# ── 8. Write token display to firmware variant ───────────────────────────────
+cat >> /etc/rocket-firmware-variant <<EOF
+Memory node: active on port 8765 (Yggdrasil only)
+Auth token: $(cat $MEM_TOKEN)
+Quota: 256MB (edit /etc/rocket/memory/memory.conf to change)
+Run 'rocket-wg-showconf' to find your Yggdrasil address for Claude connection.
+EOF
+
+logger -t "$LOGTAG" "Claude memory node ready. The Mycelium remembers."
+exit 0

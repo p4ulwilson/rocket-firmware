@@ -1,0 +1,14 @@
+#!/bin/sh
+# /etc/hotplug.d/net/30-wwan-up
+# Rocket Routers v3.4.0 — Auto-connect wwan when usb0 appears
+#
+# WHY: netifd starts at boot and tries to bring up wwan (usb0). But usb0
+# appears several seconds later via USB hotplug — after netifd has already
+# given up waiting. This script fires at exactly the right moment when usb0
+# appears and runs ifup wwan to connect the cellular interface.
+# Without this, internet does not come up after reboot without manual ifup.
+
+[ "$ACTION" = "add" ] && [ "$INTERFACE" = "usb0" ] && {
+    logger -t "rocket-wwan" "usb0 appeared — running ifup wwan"
+    ifup wwan
+}

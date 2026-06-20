@@ -1,0 +1,25 @@
+#!/bin/sh
+# 95-rocket-topology-c — Mycelium Mesh RocketRouters
+# Topology C: SFP+ (eth2) moved from br-wan to br-lan
+#             2.5G port (eth1) moved from br-wan to br-lan
+# SFP+ = LAN trunk to customer building distribution
+# Cell (usb0) = sole WAN uplink. No mwan3 failover.
+BRLAN=$(uci show network | grep "\.name='br-lan'" | cut -d. -f1,2)
+BRWAN=$(uci show network | grep "\.name='br-wan'" | cut -d. -f1,2)
+# eth2 (SFP+) — LAN trunk
+uci del_list "${BRWAN}.ports=eth2"
+uci del_list "${BRLAN}.ports=eth2" 2>/dev/null; uci add_list "${BRLAN}.ports=eth2"
+# eth1 (2.5G port) — LAN port
+uci del_list "${BRWAN}.ports=eth1"
+uci del_list "${BRLAN}.ports=eth1" 2>/dev/null; uci add_list "${BRLAN}.ports=eth1"
+# Disable ethernet WAN interfaces — cell is sole WAN in Topology C
+uci set network.wan.disabled='1'
+uci set network.wan6.disabled='1'
+# Fix: OpenWrt 23.05+ stores ipaddr in CIDR format (192.168.1.1/24)
+# which silently breaks dnsmasq dhcp-range generation — set explicitly
+uci set network.lan.ipaddr='192.168.1.1'
+uci set network.lan.netmask='255.255.255.0'
+uci commit network
+echo "C / Topology C: SFP+ (eth2) = LAN trunk | 2.5G (eth1) = LAN | Cell (usb0) = WAN uplink" \
+  > /etc/rocket-firmware-variant
+exit 0

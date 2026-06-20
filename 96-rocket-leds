@@ -1,0 +1,33 @@
+#!/bin/sh
+# /etc/uci-defaults/96-rocket-leds
+# Mycelium Mesh RocketRouters - Tricolor SYS LED scheme
+# SYS LED is RGB - all 3 colors map to same physical LED
+# Visual: warm yellow when WiFi+power up, blue flash on cell traffic.
+
+LOGTAG="rocket-led-defaults"
+logger -t "$LOGTAG" "v2.5.1 LED scheme starting"
+
+uci -q batch <<EOF
+set system.led_power=led
+set system.led_power.name='Power'
+set system.led_power.sysfs='red'
+set system.led_power.default='1'
+set system.led_power.trigger='default-on'
+
+set system.led_wifi=led
+set system.led_wifi.name='WiFi'
+set system.led_wifi.sysfs='green'
+set system.led_wifi.trigger='phy0radio'
+
+set system.led_cell=led
+set system.led_cell.name='Cell'
+set system.led_cell.sysfs='blue'
+set system.led_cell.trigger='netdev'
+set system.led_cell.dev='usb0'
+set system.led_cell.mode='tx rx'
+commit system
+EOF
+
+/etc/init.d/led restart >/dev/null 2>&1 || true
+logger -t "$LOGTAG" "v2.5.1 LED scheme complete (red=power, green=wifi, blue=cell tx/rx)"
+exit 0

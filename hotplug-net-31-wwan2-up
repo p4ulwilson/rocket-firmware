@@ -1,0 +1,21 @@
+#!/bin/sh
+# /etc/hotplug.d/net/31-wwan2-up
+# Rocket Routers v3.11.4 — Auto-connect wwan2 when usb1 appears
+#
+# WHY: mirrors hotplug-net-30-wwan-up for the second modem slot. netifd
+# starts at boot and tries to bring up wwan2 (usb1), but usb1 appears
+# several seconds later via USB hotplug — after netifd has already given
+# up waiting. This script fires at exactly the right moment when usb1
+# appears and runs ifup wwan2 to connect the second cellular interface.
+#
+# Only relevant on dual-modem (Supreme) units — 99-rocket-mwan3 only
+# configures network.wwan2 at all when MODEM_COUNT >= 2. On single-modem
+# units usb1 never appears and this script never fires.
+#
+# Replaces the old network.wwan2 proto='modemmanager' design, which could
+# never come up because 97-rocket-modem explicitly disables ModemManager.
+
+[ "$ACTION" = "add" ] && [ "$INTERFACE" = "usb1" ] && {
+    logger -t "rocket-wwan2" "usb1 appeared — running ifup wwan2"
+    ifup wwan2
+}

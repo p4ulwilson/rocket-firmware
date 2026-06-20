@@ -1,0 +1,20 @@
+# Built firmware images — not source, too large for the repo
+*.bin
+
+# Build logs
+*.log
+
+# Secrets — never commit these
+*private*.key
+*.pem
+.wrangler/
+**/.wrangler/
+claude_desktop_config_ROCKET_MEMORY.json
+
+# Stale backups
+*.pre-*-backup
+*.corrupted-backup-*
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,0 +1,120 @@
+#!/bin/sh
+# /etc/uci-defaults/95c-rocket-wireguard
+# Mycelium Mesh RocketRouters — Hidden Hands WireGuard layer
+#
+# What this does:
+#   - Generates a WireGuard keypair on first boot (never baked in — unique per device)
+#   - Configures wg0 interface via UCI (proto=wireguard)
+#   - Default LAN address: 10.10.0.1/24 (site-to-site mesh subnet)
+#   - Listens on UDP 51820
+#   - Adds a 'wg' firewall zone (input/output ACCEPT, forward ACCEPT)
+#   - Adds forwarding: wg → lan and lan → wg
+#   - Adds firewall rule: allow UDP 51820 from WAN (cell uplink) so peers can connect
+#   - Stores keys in /etc/wireguard/ (persists across firmware upgrades if sysupgrade.conf set)
+#   - Writes public key to /etc/wireguard/publickey.txt for easy retrieval
+#   - Idempotent: safe to run multiple times, skips if already configured
+#
+# Peer setup is done post-flash:
+#   - Run: rocket-wg-showconf   (shows public key + QR code)
+#   - Add peers via LuCI → Network → WireGuard, or via CLI: rocket-wg-peer-add
+#
+# WireGuard subnet: 10.10.0.0/24
+#   Site A router: 10.10.0.1   (first C1 deployed)
+#   Site B router: 10.10.0.2   (second C1 deployed)
+#   Site C router: 10.10.0.3   ... and so on
+# Change via: uci set network.wg0.addresses='10.10.0.X/24' && uci commit network
+
+set -e
+LOGTAG="rocket-wireguard"
+WG_DIR="/etc/wireguard"
+WG_PRIVKEY="$WG_DIR/privatekey"
+WG_PUBKEY="$WG_DIR/publickey.txt"
+WG_PORT="51820"
+WG_ADDR="10.10.0.1/24"
+
+logger -t "$LOGTAG" "C1 v2.6.0 WireGuard setup starting"
+
+# ── 1. Create key directory ──────────────────────────────────────────────────
+mkdir -p "$WG_DIR"
+chmod 700 "$WG_DIR"
+
+# ── 2. Generate keypair if not already present ───────────────────────────────
+if [ ! -f "$WG_PRIVKEY" ]; then
+    wg genkey > "$WG_PRIVKEY"
+    chmod 600 "$WG_PRIVKEY"
+    wg pubkey < "$WG_PRIVKEY" > "$WG_PUBKEY"
+    logger -t "$LOGTAG" "WireGuard keypair generated"
+else
+    logger -t "$LOGTAG" "WireGuard keypair already exists — skipping keygen"
+fi
+
+PRIVKEY=$(cat "$WG_PRIVKEY")
+PUBKEY=$(cat "$WG_PUBKEY")
+
+# ── 3. Configure wg0 interface ───────────────────────────────────────────────
+if ! uci -q get network.wg0 >/dev/null 2>&1; then
+    uci -q batch <<EOF
+set network.wg0=interface
+set network.wg0.proto='wireguard'
+set network.wg0.private_key='$PRIVKEY'
+set network.wg0.listen_port='$WG_PORT'
+add_list network.wg0.addresses='$WG_ADDR'
+commit network
+EOF
+    logger -t "$LOGTAG" "wg0 interface configured (addr=$WG_ADDR port=$WG_PORT)"
+else
+    logger -t "$LOGTAG" "wg0 interface already configured — skipping"
+fi
+
+# ── 4. Firewall: WireGuard zone ──────────────────────────────────────────────
+if ! uci show firewall | grep -q "name='wg'" 2>/dev/null; then
+    uci -q batch <<EOF
+add firewall zone
+set firewall.@zone[-1].name='wg'
+set firewall.@zone[-1].input='ACCEPT'
+set firewall.@zone[-1].output='ACCEPT'
+set firewall.@zone[-1].forward='ACCEPT'
+add_list firewall.@zone[-1].network='wg0'
+commit firewall
+EOF
+    logger -t "$LOGTAG" "Firewall WireGuard zone added"
+fi
+
+# ── 5. Firewall: forwarding wg ↔ lan ─────────────────────────────────────────
+if ! uci show firewall | grep -q "rocket_wg_fwd_wg_lan" 2>/dev/null; then
+    uci -q batch <<EOF
+add firewall forwarding
+set firewall.@forwarding[-1].name='rocket_wg_fwd_wg_lan'
+set firewall.@forwarding[-1].src='wg'
+set firewall.@forwarding[-1].dest='lan'
+add firewall forwarding
+set firewall.@forwarding[-1].name='rocket_wg_fwd_lan_wg'
+set firewall.@forwarding[-1].src='lan'
+set firewall.@forwarding[-1].dest='wg'
+commit firewall
+EOF
+    logger -t "$LOGTAG" "Firewall forwarding wg<->lan added"
+fi
+
+# ── 6. Firewall: allow WireGuard port inbound from WAN (cell uplink) ─────────
+if ! uci show firewall | grep -q "rocket_wg_wan_in" 2>/dev/null; then
+    uci -q batch <<EOF
+add firewall rule
+set firewall.@rule[-1].name='rocket_wg_wan_in'
+set firewall.@rule[-1].src='wan'
+set firewall.@rule[-1].proto='udp'
+set firewall.@rule[-1].dest_port='$WG_PORT'
+set firewall.@rule[-1].target='ACCEPT'
+commit firewall
+EOF
+    logger -t "$LOGTAG" "Firewall rule: UDP $WG_PORT inbound from WAN allowed"
+fi
+
+# ── 7. Update firmware variant file ──────────────────────────────────────────
+cat > /etc/rocket-firmware-variant <<EOF
+C1 / Hidden Hands: SFP+ LAN trunk | 802.11s mesh | WireGuard wg0 UDP $WG_PORT | Cell WAN
+Public key: $PUBKEY
+EOF
+
+logger -t "$LOGTAG" "C1 WireGuard setup complete. Public key: $PUBKEY"
+exit 0

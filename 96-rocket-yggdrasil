@@ -1,0 +1,171 @@
+#!/bin/sh
+# /etc/uci-defaults/96-rocket-yggdrasil
+# Mycelium Mesh RocketRouters — Yggdrasil auto-mesh layer
+#
+# What this does:
+#   - Generates Yggdrasil config on first boot (unique keypair per device)
+#   - Your IPv6 address IS your public key — cryptographically yours forever
+#   - Adds public bootstrap peers so the node joins the global Mycelium mesh
+#     automatically on first boot — no manual peer setup needed
+#   - Enables yggdrasil-jumper for NAT traversal (cell uplinks punch through)
+#   - Two Mycelium routers anywhere on Earth find each other via DHT
+#   - Adds firewall rules for Yggdrasil traffic
+#
+# v3.4.2 fix: PLAIN FORMAT PARSING
+# Root cause of all previous Yggdrasil failures:
+#   yggdrasil -genconf writes PLAIN format: PrivateKey: <hex>
+#   All previous versions grepped for JSON format: "PrivateKey": "<hex>"
+#   Result: key extraction returned empty → UCI never set → ygg0 never came up
+#   Also: Peers/Listen sed patterns used JSON quotes → peers never injected
+#
+# Fix: all grep/sed/awk now use plain format (no quotes around keys or values).
+# Also: length check changed from -eq 64 to -ge 64 (key is 128 hex chars in
+# current Yggdrasil builds, not 64).
+#
+# The Mycelium subnet is 200::/7 (Yggdrasil's cryptographic IPv6 range)
+
+LOGTAG="rocket-yggdrasil"
+YGG_CONF="/etc/yggdrasil/yggdrasil.conf"
+YGG_DIR="/etc/yggdrasil"
+
+logger -t "$LOGTAG" "Mycelium Mesh RocketRouters — Yggdrasil setup starting"
+
+# ── 1. Create config directory ───────────────────────────────────────────────
+mkdir -p "$YGG_DIR"
+chmod 700 "$YGG_DIR"
+
+# ── 2. Generate config if not present ────────────────────────────────────────
+if [ ! -f "$YGG_CONF" ]; then
+    logger -t "$LOGTAG" "Generating Yggdrasil config (new keypair)..."
+    yggdrasil -genconf > "$YGG_CONF" 2>/dev/null || {
+        logger -t "$LOGTAG" "ERROR: yggdrasil -genconf failed"
+        exit 0
+    }
+    chmod 600 "$YGG_CONF"
+    logger -t "$LOGTAG" "Yggdrasil keypair generated"
+else
+    logger -t "$LOGTAG" "Yggdrasil config already exists — skipping keygen"
+fi
+
+# ── 2a. Extract private key and save to UCI ───────────────────────────────────
+# v3.4.2 fix: use plain format parsing (PrivateKey: <hex>, no quotes)
+# Key is 128 hex chars (64 bytes) in current Yggdrasil builds
+PRIV_KEY=$(grep 'PrivateKey:' "$YGG_CONF" 2>/dev/null | awk '{print $2}')
+if [ -n "$PRIV_KEY" ] && [ ${#PRIV_KEY} -ge 64 ]; then
+    uci -q set network.ygg0=interface 2>/dev/null || true
+    uci -q set network.ygg0.proto='yggdrasil'
+    uci -q set network.ygg0.config_path="$YGG_CONF"
+    uci -q set network.ygg0.private_key="$PRIV_KEY"
+    uci -q commit network
+    logger -t "$LOGTAG" "Private key saved to UCI (${#PRIV_KEY} hex chars)"
+else
+    logger -t "$LOGTAG" "WARNING: Could not extract private key from $YGG_CONF (len=${#PRIV_KEY})"
+fi
+
+# ── 3. Inject public bootstrap peers ─────────────────────────────────────────
+# v3.4.2 fix: match plain format (Peers: [], no quotes around key name)
+if ! grep -q 'tcp://' "$YGG_CONF" 2>/dev/null; then
+    sed -i 's|Peers: \[\]|Peers: [\n    "tcp://[2001:41d0:2:ba51::1]:51902",\n    "tcp://45.147.198.155:12345",\n    "tcp://[2a09:8280:1::a:d2c]:17002",\n    "tls://[2604:180:f2::6b]:443",\n    "tcp://[2607:5300:201:3100::50a1]:51820"\n  ]|' "$YGG_CONF"
+    logger -t "$LOGTAG" "Bootstrap peers injected"
+else
+    logger -t "$LOGTAG" "Peers already configured — skipping"
+fi
+
+# ── 4. Set listen address ────────────────────────────────────────────────────
+# v3.4.2 fix: match plain format (Listen: [], no quotes around key name)
+if grep -q 'Listen: \[\]' "$YGG_CONF" 2>/dev/null; then
+    sed -i 's|Listen: \[\]|Listen: ["tls://0.0.0.0:0"]|' "$YGG_CONF"
+    logger -t "$LOGTAG" "Listen address configured"
+fi
+
+# ── 5. Firewall: Yggdrasil/Mycelium zone ─────────────────────────────────────
+if ! uci show firewall | grep -q "name='mycelium'" 2>/dev/null; then
+    uci -q batch <<EOF
+add firewall zone
+set firewall.@zone[-1].name='mycelium'
+set firewall.@zone[-1].input='ACCEPT'
+set firewall.@zone[-1].output='ACCEPT'
+set firewall.@zone[-1].forward='ACCEPT'
+add_list firewall.@zone[-1].network='ygg0'
+commit firewall
+EOF
+    logger -t "$LOGTAG" "Firewall Mycelium zone added"
+fi
+
+# ── 6. Firewall: forwarding mycelium ↔ lan ────────────────────────────────────
+if ! uci show firewall | grep -q "rocket_ygg_fwd" 2>/dev/null; then
+    uci -q batch <<EOF
+add firewall forwarding
+set firewall.@forwarding[-1].name='rocket_ygg_fwd_myc_lan'
+set firewall.@forwarding[-1].src='mycelium'
+set firewall.@forwarding[-1].dest='lan'
+add firewall forwarding
+set firewall.@forwarding[-1].name='rocket_ygg_fwd_lan_myc'
+set firewall.@forwarding[-1].src='lan'
+set firewall.@forwarding[-1].dest='mycelium'
+commit firewall
+EOF
+    logger -t "$LOGTAG" "Firewall forwarding mycelium<->lan added"
+fi
+
+# ── 7. Enable yggdrasil-jumper ───────────────────────────────────────────────
+if [ -f /etc/init.d/yggdrasil-jumper ]; then
+    /etc/init.d/yggdrasil-jumper enable >/dev/null 2>&1 || true
+    logger -t "$LOGTAG" "yggdrasil-jumper enabled"
+fi
+
+# ── 8. Enable yggdrasil ──────────────────────────────────────────────────────
+/etc/init.d/yggdrasil enable >/dev/null 2>&1 || true
+
+# ── 9. Deploy rocket-ygg-persist init script ─────────────────────────────────
+# Runs at boot order 19 (before netifd=20). Syncs UCI private_key from the
+# conf file so netifd always uses the correct key and ygg0 gets the same
+# IPv6 address on every boot.
+# v3.4.2 fix: plain format parsing throughout (was JSON format, never matched)
+cat > /etc/init.d/rocket-ygg-persist <<'INITD'
+#!/bin/sh /etc/rc.common
+# Rocket Routers v3.4.2 — Yggdrasil keypair persistence
+# Syncs UCI network.ygg0.private_key from yggdrasil.conf before netifd starts.
+# Ensures same Mycelium IPv6 address on every boot.
+
+START=19
+STOP=91
+USE_PROCD=1
+
+YGG_CONF="/etc/yggdrasil/yggdrasil.conf"
+LOGTAG="rocket-ygg-persist"
+
+start_service() {
+    [ -f "$YGG_CONF" ] || {
+        logger -t "$LOGTAG" "WARNING: $YGG_CONF not found — skipping"
+        return 0
+    }
+
+    # v3.4.2 fix: plain format (PrivateKey: <hex>) not JSON ("PrivateKey": "<hex>")
+    CONF_KEY=$(grep 'PrivateKey:' "$YGG_CONF" 2>/dev/null | awk '{print $2}')
+    [ -n "$CONF_KEY" ] && [ ${#CONF_KEY} -ge 64 ] || {
+        logger -t "$LOGTAG" "WARNING: Cannot read PrivateKey from $YGG_CONF (len=${#CONF_KEY})"
+        return 0
+    }
+
+    UCI_KEY=$(uci -q get network.ygg0.private_key 2>/dev/null)
+
+    if [ "$UCI_KEY" != "$CONF_KEY" ]; then
+        uci -q set network.ygg0=interface 2>/dev/null || true
+        uci -q set network.ygg0.proto='yggdrasil'
+        uci -q set network.ygg0.config_path="$YGG_CONF"
+        uci -q set network.ygg0.private_key="$CONF_KEY"
+        uci -q commit network
+        logger -t "$LOGTAG" "Private key synced to UCI"
+    else
+        logger -t "$LOGTAG" "Private key OK — UCI matches conf"
+    fi
+}
+INITD
+
+chmod +x /etc/init.d/rocket-ygg-persist
+/etc/init.d/rocket-ygg-persist enable >/dev/null 2>&1 || true
+logger -t "$LOGTAG" "rocket-ygg-persist deployed and enabled"
+
+logger -t "$LOGTAG" "Mycelium Mesh RocketRouters setup complete"
+exit 0

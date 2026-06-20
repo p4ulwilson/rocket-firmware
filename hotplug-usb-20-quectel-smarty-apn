@@ -1,0 +1,54 @@
+#!/bin/sh
+# /etc/hotplug.d/usb/20-quectel-smarty-apn
+# Rocket Routers v3.4.0 — Re-apply Smarty/Three APN after RM500U-EA USB connect
+#
+# Fires when: modem enumerates on USB (boot, power cycle, USB reconnect, cfun reset)
+# WHY: AT+CGDCONT is runtime-only on RM500U-EA — lost on every USB re-enumeration.
+#      Without this, APN goes blank and internet breaks silently after modem reset.
+#
+# autoapn=1 is kept for plug-and-play with standard SIMs. This script re-applies
+# three.co.uk as fallback for Smarty/Three UK (MVNO) on every USB connect event.
+
+[ "$ACTION" = "add" ] || exit 0
+
+# Match Quectel RM500U-EA (USB ID 2c7c:0900)
+VENDOR=$(cat /sys/bus/usb/devices/${DEVICENAME}/idVendor 2>/dev/null)
+PRODUCT=$(cat /sys/bus/usb/devices/${DEVICENAME}/idProduct 2>/dev/null)
+[ "$VENDOR" = "2c7c" ] && [ "$PRODUCT" = "0900" ] || exit 0
+
+logger -t "rocket-apn" "RM500U-EA USB connected — re-applying APN"
+
+# Wait for ttyUSB2 to settle (USB CDC serial enumeration takes ~3s)
+TRIES=0
+while [ ! -e /dev/ttyUSB2 ] && [ $TRIES -lt 10 ]; do
+    sleep 2
+    TRIES=$((TRIES + 1))
+done
+
+if [ ! -e /dev/ttyUSB2 ]; then
+    logger -t "rocket-apn" "ERROR: /dev/ttyUSB2 not found after 20s — APN not set"
+    exit 1
+fi
+
+# Additional settle time — modem AT interface needs time after ttyUSB2 appears
+# Error 1 (CME ERROR) means modem not ready yet; retry loop fixes this
+sleep 5
+
+# Retry loop: attempt AT+CGDCONT up to 5 times with 5s between attempts
+# RM500U-EA can take 10-20s after USB enumeration before accepting AT commands
+APN_SET=0
+for attempt in 1 2 3 4 5; do
+    sms_tool -d /dev/ttyUSB2 at 'AT+CGDCONT=1,"IPV4V6","three.co.uk"' >/dev/null 2>&1
+    RET=$?
+    if [ $RET -eq 0 ]; then
+        logger -t "rocket-apn" "APN set: three.co.uk (attempt $attempt)"
+        APN_SET=1
+        break
+    fi
+    logger -t "rocket-apn" "Attempt $attempt failed (error $RET) — retrying in 5s"
+    sleep 5
+done
+
+if [ $APN_SET -eq 0 ]; then
+    logger -t "rocket-apn" "WARNING: AT+CGDCONT failed after 5 attempts — APN not set"
+fi

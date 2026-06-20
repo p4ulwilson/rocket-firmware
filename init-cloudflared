@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/cloudflared
+# procd service for Cloudflare Tunnel
+# Binary lives on SSD at /mnt/ssd/cloudflared — graceful no-op if not present
+# Bypasses ISP port blocking (Three UK CGNAT etc) — outbound tunnel only
+# Rocket Routers v3.6.0+
+
+START=98
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    [ -x /mnt/ssd/cloudflared ] || return 0
+    [ -f /root/.cloudflared/config.yml ] || return 0
+
+    procd_open_instance
+    procd_set_param command /mnt/ssd/cloudflared \
+        --origincert /mnt/ssd/cloudflared-config/cert.pem \
+        --config /root/.cloudflared/config.yml \
+        tunnel run
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn
+    procd_close_instance
+}

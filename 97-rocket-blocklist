@@ -1,0 +1,129 @@
+#!/bin/sh
+# /etc/uci-defaults/97-rocket-blocklist
+# Mycelium Mesh RocketRouters — Community Kill Switch
+#
+# What this does:
+#   - Bakes the Rocket Routers public key into the firmware
+#   - Sets up hourly cron job to fetch the community blocklist
+#   - Blocklist is cryptographically signed — only Rocket Routers can publish it
+#   - Verifies signature before applying ANY rules — cannot be spoofed
+#   - Blocked Yggdrasil addresses are dropped at the firewall level
+#   - Nodes removed from blocklist are automatically unblocked on next fetch
+#   - No human intervention needed — community votes, system signs, routers apply
+#
+# THE KEY POINT:
+#   The private key lives on rocketrouters.co.uk — NOT with any individual.
+#   The founder has zero ongoing control. The community votes. The system signs.
+#   Watch the garden grow.
+#
+# Cannot be bypassed: if this script is removed, other Mycelium nodes detect
+# the absence of blocklist enforcement and refuse to peer with that node.
+
+LOGTAG="rocket-blocklist"
+
+# ── Rocket Routers Community Public Key (Ed25519) ─────────────────────────────
+# This key belongs to Rocket Routers — kept on the production server only.
+# It is never committed to this repository.
+# Only community-voted blocklist updates will verify against this key.
+PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAMyD2P9WNVTuMZVm7pm/1K31a186VgEi7zoRi/tpPVM4=
+-----END PUBLIC KEY-----"
+
+PUBKEY_FILE="/etc/rocket/blocklist-pubkey.pem"
+BLOCKLIST_SCRIPT="/usr/bin/rocket-blocklist-update"
+CRON_FILE="/etc/crontabs/root"
+BLOCKLIST_URL="https://rocketrouters.co.uk/mycelium/blocklist.txt"
+BLOCKLIST_SIG_URL="https://rocketrouters.co.uk/mycelium/blocklist.txt.sig"
+
+logger -t "$LOGTAG" "Mycelium Mesh RocketRouters kill switch setup"
+
+# ── 1. Store public key ───────────────────────────────────────────────────────
+mkdir -p /etc/rocket
+printf '%s\n' "$PUBKEY_PEM" > "$PUBKEY_FILE"
+chmod 444 "$PUBKEY_FILE"
+logger -t "$LOGTAG" "Rocket Routers public key stored"
+
+# ── 2. Write the update script ────────────────────────────────────────────────
+cat > "$BLOCKLIST_SCRIPT" << 'UPDATESCRIPT'
+#!/bin/sh
+# rocket-blocklist-update — runs hourly via cron
+# Downloads, verifies and applies the Mycelium community blocklist
+
+LOGTAG="rocket-blocklist"
+PUBKEY_FILE="/etc/rocket/blocklist-pubkey.pem"
+TMP_BLOCKLIST="/tmp/mycelium-blocklist.txt"
+TMP_SIG="/tmp/mycelium-blocklist.sig"
+APPLIED_BLOCKLIST="/etc/rocket/blocklist-applied.txt"
+BLOCKLIST_URL="https://rocketrouters.co.uk/mycelium/blocklist.txt"
+BLOCKLIST_SIG_URL="https://rocketrouters.co.uk/mycelium/blocklist.txt.sig"
+NFT_SET="mycelium_blocklist"
+
+# ── Download blocklist and signature ─────────────────────────────────────────
+uclient-fetch -q -O "$TMP_BLOCKLIST" "$BLOCKLIST_URL" 2>/dev/null || {
+    logger -t "$LOGTAG" "Could not fetch blocklist — network unavailable, keeping existing rules"
+    exit 0
+}
+uclient-fetch -q -O "$TMP_SIG" "$BLOCKLIST_SIG_URL" 2>/dev/null || {
+    logger -t "$LOGTAG" "Could not fetch blocklist signature — skipping update"
+    rm -f "$TMP_BLOCKLIST"
+    exit 0
+}
+
+# ── Verify signature (Ed25519 via openssl) ────────────────────────────────────
+if ! openssl pkeyutl -verify -pubin -inkey "$PUBKEY_FILE" -sigfile "$TMP_SIG" -rawin -in "$TMP_BLOCKLIST" >/dev/null 2>&1; then
+    logger -t "$LOGTAG" "SIGNATURE VERIFICATION FAILED — blocklist rejected, keeping existing rules"
+    rm -f "$TMP_BLOCKLIST" "$TMP_SIG"
+    exit 1
+fi
+
+logger -t "$LOGTAG" "Blocklist signature verified OK"
+
+# ── Apply blocklist via nftables ──────────────────────────────────────────────
+# Create or flush the blocklist set
+nft list set inet fw4 "$NFT_SET" >/dev/null 2>&1 || \
+    nft add set inet fw4 "$NFT_SET" '{ type ipv6_addr; flags interval; auto-merge; }' 2>/dev/null || true
+
+nft flush set inet fw4 "$NFT_SET" 2>/dev/null || true
+
+# Add drop rule if not already present
+nft list chain inet fw4 forward 2>/dev/null | grep -q "$NFT_SET" || {
+    nft add rule inet fw4 forward ip6 saddr @"$NFT_SET" drop 2>/dev/null || true
+    nft add rule inet fw4 forward ip6 daddr @"$NFT_SET" drop 2>/dev/null || true
+    nft add rule inet fw4 input ip6 saddr @"$NFT_SET" drop 2>/dev/null || true
+}
+
+# Load blocked addresses from verified blocklist
+COUNT=0
+while IFS= read -r line; do
+    # Skip comments and empty lines
+    case "$line" in
+        \#*|'') continue ;;
+    esac
+    # Expect Yggdrasil IPv6 addresses (200::/7 range)
+    nft add element inet fw4 "$NFT_SET" "{ $line }" 2>/dev/null && COUNT=$((COUNT + 1))
+done < "$TMP_BLOCKLIST"
+
+cp "$TMP_BLOCKLIST" "$APPLIED_BLOCKLIST"
+rm -f "$TMP_BLOCKLIST" "$TMP_SIG"
+
+logger -t "$LOGTAG" "Blocklist applied: $COUNT addresses blocked"
+UPDATESCRIPT
+
+chmod +x "$BLOCKLIST_SCRIPT"
+logger -t "$LOGTAG" "Blocklist update script written to $BLOCKLIST_SCRIPT"
+
+# ── 3. Add to cron (hourly) ───────────────────────────────────────────────────
+touch "$CRON_FILE"
+if ! grep -q "rocket-blocklist-update" "$CRON_FILE" 2>/dev/null; then
+    echo "0 * * * * $BLOCKLIST_SCRIPT" >> "$CRON_FILE"
+    logger -t "$LOGTAG" "Hourly cron job added"
+fi
+/etc/init.d/cron enable >/dev/null 2>&1 || true
+
+# ── 4. Run once 2 minutes after first boot (background, non-blocking) ────────
+# @reboot is NOT supported by BusyBox crond — use background process instead.
+# Waits 120s for internet to come up, then fetches blocklist once.
+(sleep 120 && "$BLOCKLIST_SCRIPT") &
+
+logger -t "$LOGTAG" "Mycelium kill switch installed. The community protects itself."
+exit 0

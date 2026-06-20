@@ -1,0 +1,130 @@
+#!/bin/sh
+# /etc/uci-defaults/98-rocket-wifi
+# Mycelium Mesh RocketRouters - WiFi auto-configuration
+# Runs once on first boot. Configures all radios with rocketrouter7 SSID,
+# tri-band single-SSID for band roaming, and per-band best-fit encryption.
+#
+# v2.5.5: dropped 802.11r FT (broke hostapd on SNAPSHOT + MT7996). Kept
+# 802.11k + v (smart roaming hints) and 802.11s mesh on radio1.
+#
+# v3.4.0 fix: REMOVED set -e. It caused the entire script to bail silently
+# if any single UCI command failed (e.g. default_radioX interface not yet in
+# default config). Result: uci commit wireless never ran, all radios stayed
+# disabled. Script now logs each failure and continues regardless.
+#
+# v3.10.1 fix: 6GHz was shipping CH=33/EHT320 + encryption=none. hostapd
+# hard-refuses any open/pre-RSNA AP on 6GHz, so every fresh unit's 6GHz radio
+# came up disabled. Fixed: 6GHz now gets EHT160+auto channel (320MHz needs AFC
+# auth we don't have) and a per-unit default WPA3 (SAE) password derived from
+# the LAN MAC, so it works out of the box. 2.4/5GHz still ship open as before.
+#
+# IMPORTANT: PASSPHRASE IS SET HERE. Change before building per-customer firmware.
+# Country code: US by default for max TX power. Change to GB for UK regulatory.
+
+LOGTAG="rocket-wifi-defaults"
+logger -t "$LOGTAG" "v3.10.1 WiFi auto-configuration starting"
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION - edit these per-build / per-customer
+# ---------------------------------------------------------------------------
+SSID='rocketrouter7'
+# 2.4/5GHz ship open — user sets their own password via the dashboard WiFi card.
+# 6GHz CANNOT ship open (hostapd hard-refuses pre-RSNA security on 6GHz), so it
+# gets a unique-per-unit default password derived from the LAN MAC address —
+# same convention as the printed-on-box default password/key on most consumer
+# APs. No database needed; Paul can recompute it for a box label from the MAC.
+PASSPHRASE=''
+COUNTRY='US'                          # US for max TX power on 6 GHz (27 dBm)
+
+_MAC=$(cat /sys/class/net/eth0/address 2>/dev/null)
+[ -z "$_MAC" ] && _MAC=$(cat /sys/class/net/br-lan/address 2>/dev/null)
+_MAC_HEX=$(printf '%s' "$_MAC" | tr -d ':' | tr 'a-z' 'A-Z' | tr -cd 'A-F0-9')
+_MAC_TAIL=$(printf '%s' "$_MAC_HEX" | tail -c 6)
+[ -z "$_MAC_TAIL" ] && _MAC_TAIL='ROCKET'
+DEFAULT_6G_KEY="Rocket-${_MAC_TAIL}"
+logger -t "$LOGTAG" "6GHz default key derived from MAC: $DEFAULT_6G_KEY"
+
+# ---------------------------------------------------------------------------
+# Apply to every wireless device found (radio0, radio1, radio2, ...)
+# ---------------------------------------------------------------------------
+CONFIGURED=0
+i=0
+while uci -q get wireless.radio${i} >/dev/null 2>&1; do
+    RADIO="radio${i}"
+    DEFIFACE="default_radio${i}"
+
+    # Country code + enable
+    uci set wireless.${RADIO}.country="$COUNTRY" 2>/dev/null || logger -t "$LOGTAG" "WARN: country set failed on $RADIO"
+    uci set wireless.${RADIO}.disabled='0' 2>/dev/null || logger -t "$LOGTAG" "WARN: enable failed on $RADIO"
+    uci set wireless.${RADIO}.cell_density='0' 2>/dev/null
+
+    # Detect band; infer from radio index if missing (typical tri-band: 0=2g, 1=5g, 2=6g)
+    BAND=$(uci -q get wireless.${RADIO}.band)
+    if [ -z "$BAND" ]; then
+        case "$i" in
+            0) BAND='2g' ;;
+            1) BAND='5g' ;;
+            2) BAND='6g' ;;
+        esac
+        uci set wireless.${RADIO}.band="$BAND" 2>/dev/null
+    fi
+
+    # Force a fixed channel per band (avoids ACS lookups; especially important on
+    # 6 GHz where ACS without AFC fails under US country code)
+    case "$BAND" in
+        2g)  CH='1';    HT='EHT20'  ;;   # 2.4 GHz - 20 MHz
+        5g)  CH='40';   HT='EHT80'  ;;   # 5 GHz   - 80 MHz
+        # 6 GHz: 320MHz (EHT320) generally needs AFC auth consumer APs don't
+        # have. EHT160 + auto channel is the widest mode confirmed working at
+        # full indoor power on the live unit — same fix as fix6g= in the CGI.
+        6g)  CH='auto'; HT='EHT160' ;;
+    esac
+    uci set wireless.${RADIO}.channel="$CH" 2>/dev/null
+    uci set wireless.${RADIO}.htmode="$HT" 2>/dev/null
+
+    # Create the default interface section if it does not exist yet
+    if ! uci -q get wireless.${DEFIFACE} >/dev/null 2>&1; then
+        uci -q add wireless wifi-iface >/dev/null 2>&1
+        uci -q rename wireless.@wifi-iface[-1]="${DEFIFACE}" 2>/dev/null || true
+        uci set wireless.${DEFIFACE}.device="${RADIO}" 2>/dev/null
+        uci set wireless.${DEFIFACE}.mode='ap' 2>/dev/null
+        logger -t "$LOGTAG" "Created missing iface section: $DEFIFACE"
+    fi
+
+    # SSID. 2.4/5GHz: open network, user sets password via dashboard WiFi card.
+    # 6GHz: MUST have WPA3 — hostapd refuses open APs on 6GHz outright — so it
+    # gets the per-unit default key computed above instead.
+    uci set wireless.${DEFIFACE}.ssid="$SSID" 2>/dev/null || logger -t "$LOGTAG" "WARN: ssid set failed on $DEFIFACE"
+    if [ "$BAND" = '6g' ]; then
+        uci set wireless.${DEFIFACE}.encryption='sae' 2>/dev/null
+        uci set wireless.${DEFIFACE}.key="$DEFAULT_6G_KEY" 2>/dev/null
+    else
+        uci set wireless.${DEFIFACE}.encryption='none' 2>/dev/null
+        uci -q delete wireless.${DEFIFACE}.key 2>/dev/null || true
+    fi
+    uci set wireless.${DEFIFACE}.disabled='0' 2>/dev/null
+
+    # 802.11k (Radio Resource Measurement) + 802.11v (BSS Transition Management)
+    # Helps clients roam smoothly between bands and APs.
+    uci set wireless.${DEFIFACE}.ieee80211k='1' 2>/dev/null
+    uci set wireless.${DEFIFACE}.ieee80211v='1' 2>/dev/null
+
+    if [ "$BAND" = '6g' ]; then
+        logger -t "$LOGTAG" "Configured ${RADIO} (band=$BAND ch=$CH enc=sae/default-key)"
+    else
+        logger -t "$LOGTAG" "Configured ${RADIO} (band=$BAND ch=$CH enc=none/open)"
+    fi
+    CONFIGURED=$((CONFIGURED + 1))
+    i=$((i+1))
+done
+
+if [ "$CONFIGURED" -eq 0 ]; then
+    logger -t "$LOGTAG" "WARNING: no wireless radios found in UCI — WiFi not configured"
+else
+    uci commit wireless
+    logger -t "$LOGTAG" "uci commit wireless done ($CONFIGURED radios)"
+    wifi reload >/dev/null 2>&1 || logger -t "$LOGTAG" "WARN: wifi reload returned non-zero (may be OK on first boot)"
+fi
+
+logger -t "$LOGTAG" "v3.10.1 WiFi configuration complete: SSID=$SSID country=$COUNTRY"
+exit 0

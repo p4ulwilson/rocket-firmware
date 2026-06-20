@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Rocket Routers</title>
+<style>body{background:#0d1117;margin:0}</style>
+</head>
+<body>
+<script>
+var c = document.cookie;
+if(c.indexOf('sysauth_http')!==-1 || c.indexOf('sysauth_https')!==-1 || c.indexOf('sysauth')!==-1){
+  window.location.replace('/cgi-bin/luci/admin');
+} else {
+  window.location.replace('/cgi-bin/rocket');
+}
+</script>
+</body>
+</html>

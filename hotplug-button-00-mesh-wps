@@ -1,0 +1,38 @@
+#!/bin/sh
+# /etc/hotplug.d/button/00-mesh-wps
+# Mycelium Mesh RocketRouters
+#
+# Case-labelled "MESH" button. Internally this is the board's "wps" GPIO key
+# (confirmed via /proc/device-tree/gpio-keys/*/label - this board ships no
+# real WPS support in wpad, so the slot was relabelled for mesh control
+# instead). Handled here via the legacy gpio-button-hotplug mechanism
+# (kmod-gpio-button-hotplug), NOT /etc/rc.button - this board has no procd
+# button handler for "wps", only for "reset".
+#
+# Hold durations (chosen deliberately short of the RST slot's own thresholds
+# - see /etc/rc.button/reset - so the two physical controls never overlap):
+#   < 2s   : ignored (accidental bump)
+#   2s-8s  : toggle local 802.11s neighbourhood mesh (wireless.rocket_mesh)
+#   >= 8s  : reserved for WPS pairing - NOT functional on this build, this
+#            wpad lacks hostapd_cli/wps_* support entirely. Logged only.
+#            Revisit once a WPS-capable wpad (wpad-full/wpad-openssl) is
+#            in the image - see task #16.
+
+[ "$BUTTON" = "wps" ] || exit 0
+[ "$ACTION" = "released" ] || exit 0
+
+if [ "$SEEN" -lt 2 ]; then
+    exit 0
+elif [ "$SEEN" -lt 8 ]; then
+    logger -t rocket-mesh-btn "MESH button held ${SEEN}s - toggling local mesh"
+    CUR=$(uci -q get wireless.rocket_mesh.disabled 2>/dev/null)
+    if [ "$CUR" = "1" ]; then
+        uci set wireless.rocket_mesh.disabled='0'
+    else
+        uci set wireless.rocket_mesh.disabled='1'
+    fi
+    uci commit wireless
+    wifi reload >/dev/null 2>&1
+else
+    logger -t rocket-mesh-btn "MESH button held ${SEEN}s - WPS requested but not supported on this build (no hostapd_cli/wps support compiled in)"
+fi

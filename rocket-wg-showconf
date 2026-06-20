@@ -1,0 +1,140 @@
+#!/bin/sh
+# /usr/bin/rocket-wg-showconf
+# Rocket Routers C1 — WireGuard config display helper
+#
+# Usage:
+#   rocket-wg-showconf          → shows public key, port, address, peer count
+#   rocket-wg-showconf qr       → shows QR code for phone/tablet WireGuard app
+#   rocket-wg-showconf peer     → interactive: build a peer config for a remote site
+#
+# Install path: files/usr/bin/rocket-wg-showconf  (chmod +x)
+
+WG_DIR="/etc/wireguard"
+WG_PUBKEY="$WG_DIR/publickey.txt"
+WG_PORT="51820"
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
+BLU='\033[0;34m'; CYN='\033[0;36m'; RST='\033[0m'; BLD='\033[1m'
+
+die() { echo "${RED}ERROR: $1${RST}" >&2; exit 1; }
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+[ -f "$WG_PUBKEY" ] || die "WireGuard keys not found. Has the router been booted once with C1 firmware?"
+command -v wg >/dev/null 2>&1 || die "wireguard-tools not installed"
+
+PUBKEY=$(cat "$WG_PUBKEY")
+WG_ADDR=$(uci -q get network.wg0.addresses | head -1)
+PEER_COUNT=$(wg show wg0 peers 2>/dev/null | wc -l)
+
+# ── Mode dispatch ─────────────────────────────────────────────────────────────
+case "${1:-info}" in
+
+# ─────────────────────────────────────────────────────────────────────────────
+info)
+    echo ""
+    echo "${BLD}${CYN}╔══════════════════════════════════════════════════╗${RST}"
+    echo "${BLD}${CYN}║       Rocket Routers C1 — WireGuard Config       ║${RST}"
+    echo "${BLD}${CYN}╚══════════════════════════════════════════════════╝${RST}"
+    echo ""
+    echo "  ${BLD}Public Key  :${RST} ${GRN}${PUBKEY}${RST}"
+    echo "  ${BLD}Listen Port :${RST} ${YLW}UDP ${WG_PORT}${RST}"
+    echo "  ${BLD}WG Address  :${RST} ${BLU}${WG_ADDR:-not set}${RST}"
+    echo "  ${BLD}Peers       :${RST} ${PEER_COUNT} configured"
+    echo ""
+    if [ "$PEER_COUNT" -gt 0 ]; then
+        echo "  ${BLD}Active peers:${RST}"
+        wg show wg0 2>/dev/null | grep -E "peer:|endpoint:|allowed ips:|latest handshake:" | \
+            sed 's/^/    /'
+        echo ""
+    fi
+    echo "  ${BLD}Tip:${RST} run ${CYN}rocket-wg-showconf qr${RST} to generate a QR code"
+    echo "       run ${CYN}rocket-wg-showconf peer${RST} to add a remote site"
+    echo ""
+    ;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+qr)
+    command -v qrencode >/dev/null 2>&1 || die "qrencode not installed. Run: opkg install qrencode"
+
+    # Build a standard WireGuard client config pointing TO this router
+    # User needs to fill in the Endpoint IP (cell WAN IP) after scanning
+    CONF=$(cat <<WGCONF
+[Interface]
+# Replace Address with your client's WireGuard IP (e.g. 10.10.0.10/24)
+Address = 10.10.0.10/24
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = ${PUBKEY}
+# Replace Endpoint with this router's WAN IP:port
+Endpoint = YOUR.WAN.IP.HERE:${WG_PORT}
+AllowedIPs = 10.10.0.0/24
+PersistentKeepalive = 25
+WGCONF
+)
+    echo ""
+    echo "${BLD}${YLW}Scan this QR code with the WireGuard app:${RST}"
+    echo "(Edit Endpoint on the client after import)"
+    echo ""
+    echo "$CONF" | qrencode -t ANSIUTF8
+    echo ""
+    echo "${BLD}Raw config:${RST}"
+    echo "$CONF"
+    echo ""
+    ;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+peer)
+    # Interactive: add a remote Rocket C1 router as a WireGuard peer
+    echo ""
+    echo "${BLD}${CYN}── Add Remote Site (Site-to-Site WireGuard Peer) ──${RST}"
+    echo ""
+    printf "  Remote router public key  : "; read -r REMOTE_PUBKEY
+    printf "  Remote router WAN IP      : "; read -r REMOTE_IP
+    printf "  Remote WireGuard port [${WG_PORT}]: "; read -r REMOTE_PORT
+    REMOTE_PORT="${REMOTE_PORT:-$WG_PORT}"
+    printf "  Remote WG address (e.g. 10.10.0.2/32): "; read -r REMOTE_WGADDR
+    printf "  Peer name (no spaces, e.g. site-b)    : "; read -r PEER_NAME
+    PEER_NAME="${PEER_NAME:-peer$(date +%s)}"
+
+    [ -z "$REMOTE_PUBKEY" ] && die "Public key required"
+    [ -z "$REMOTE_IP" ]     && die "Remote IP required"
+    [ -z "$REMOTE_WGADDR" ] && die "Remote WG address required"
+
+    # Strip /prefix from AllowedIPs if user typed it as address (use /32 for host route)
+    ALLOWED="${REMOTE_WGADDR%%/*}/32"
+
+    uci -q batch <<EOF
+set network.${PEER_NAME}=wireguard_wg0
+set network.${PEER_NAME}.public_key='${REMOTE_PUBKEY}'
+set network.${PEER_NAME}.endpoint_host='${REMOTE_IP}'
+set network.${PEER_NAME}.endpoint_port='${REMOTE_PORT}'
+add_list network.${PEER_NAME}.allowed_ips='${ALLOWED}'
+set network.${PEER_NAME}.persistent_keepalive='25'
+set network.${PEER_NAME}.description='${PEER_NAME}'
+commit network
+EOF
+
+    echo ""
+    echo "  ${GRN}✓ Peer '${PEER_NAME}' added.${RST}"
+    echo "  Reloading network..."
+    /etc/init.d/network reload >/dev/null 2>&1
+    echo "  ${GRN}Done. Check with: wg show wg0${RST}"
+    echo ""
+    echo "  ${YLW}Remember to add THIS router as a peer on the remote side:${RST}"
+    echo "  Public key : ${GRN}${PUBKEY}${RST}"
+    echo "  Endpoint   : <this router's WAN IP>:${WG_PORT}"
+    echo "  AllowedIPs : ${WG_ADDR:-10.10.0.1/32}"
+    echo ""
+    ;;
+
+# ─────────────────────────────────────────────────────────────────────────────
+*)
+    echo "Usage: rocket-wg-showconf [info|qr|peer]"
+    echo "  info  — show public key, port, peers (default)"
+    echo "  qr    — generate QR code for WireGuard app import"
+    echo "  peer  — interactively add a remote site peer"
+    exit 1
+    ;;
+esac

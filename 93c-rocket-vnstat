@@ -1,0 +1,29 @@
+#!/bin/sh
+# 93c-rocket-vnstat — auto-register interfaces with vnstat2 on first boot
+# Runs once via uci-defaults then deletes itself
+
+IFACES="usb0 br-lan eth0 wlan0 wlan1 wlan2"
+
+# Wait for vnstat daemon to be ready
+sleep 3
+
+# Enable and start vnstat service
+/etc/init.d/vnstat enable 2>/dev/null
+/etc/init.d/vnstat start 2>/dev/null
+
+sleep 2
+
+# Register each interface — vnstat ignores ones that don't exist yet
+for IFACE in $IFACES; do
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        vnstat --add -i "$IFACE" 2>/dev/null && \
+            logger -t rocket-vnstat "Registered interface: $IFACE"
+    fi
+done
+
+# Also register usb0 unconditionally — modem may not be up yet but vnstat handles it
+vnstat --add -i usb0 2>/dev/null
+
+logger -t rocket-vnstat "vnstat2 interface registration complete"
+
+exit 0

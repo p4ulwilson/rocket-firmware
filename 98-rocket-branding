@@ -1,0 +1,26 @@
+#!/bin/sh
+# /etc/uci-defaults/98-rocket-branding
+# Mycelium Mesh RocketRouters — Router hostname and branding
+#
+# Sets the router hostname to rocketrouters so it's identifiable on the network.
+# Without this all routers show "OpenWrt" which is useless when you have multiple.
+#
+# All variants → hostname rocketrouters (consistent branding across all units)
+
+LOGTAG="rocket-branding"
+HOSTNAME="rocketrouters"
+
+logger -t "$LOGTAG" "Setting hostname to $HOSTNAME"
+
+uci -q set system.@system[0].hostname="$HOSTNAME"
+# v3.11.8 fix: description used to hardcode a literal version number
+# (v3.10.1), same stale-banner bug as 99-rocket-mwan3 — it never tracked
+# what was actually built. Placeholder substituted by the build script.
+uci -q set system.@system[0].description="Mycelium Mesh RocketRouters v__ROCKET_FW_VERSION__"
+uci -q commit system
+
+# Apply immediately without reboot
+echo "$HOSTNAME" > /proc/sys/kernel/hostname 2>/dev/null || true
+
+logger -t "$LOGTAG" "Hostname set: $HOSTNAME"
+exit 0

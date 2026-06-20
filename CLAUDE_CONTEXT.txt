@@ -1,0 +1,133 @@
+== ROCKET ROUTERS — CLAUDE SESSION CONTEXT ==
+Paste this at the start of a new Claude session to restore full context.
+Last updated: June 2026
+
+== WHAT WE'RE BUILDING ==
+Rocket Plus E firmware — custom OpenWRT for ZBT ZBT-8803BE router.
+Everything baked into a single sysupgrade .bin: packages + dashboard CGI + configs.
+
+== HARDWARE ==
+Device:       ZBT ZBT-8803 BE
+SoC:          MediaTek MT7981B (Filogic 820), aarch64_cortex-a53
+WiFi:         MT7996 tri-band (4 radios: 2.4GHz, 5GHz, 5GHz, 6GHz)
+Target:       mediatek/filogic
+Board name:   zbtlink,zbt-z8803be
+
+== SOURCES ==
+OpenWRT fork: https://github.com/pttuan/openwrt
+  (ZBT-8803 is NOT in official OpenWRT mainline — pttuan added it)
+  Key commit: fce4731b5c3323ad3652643d64bf0f78e51293b0
+  Local: ~/src/openwrt (on WSL)
+
+QModem feed:  https://github.com/FUjr/QModem
+  (modem management: luci-app-qmodem-next, sms, tom_modem, etc.)
+  Added via: echo "src-git qmodem https://github.com/FUjr/QModem.git" >> feeds.conf.default
+
+== BUILD LOCATION ==
+WSL on Windows. Source at ~/src/openwrt
+Build scripts at: D:\Rocket-Routers-Website\firmware-build\
+Current build script: build-v3.9.0.sh  (next: build-v3.9.1.sh)
+Run from WSL: bash /mnt/d/Rocket-Routers-Website/firmware-build/build-v3.9.0.sh
+
+== PACKAGE CONFIG ==
+Main packages file: rocket-vE.config (append to .config before build)
+Key packages: mwan3, luci-app-mwan3, qmodem suite, luci full stack,
+  wireguard, vnstat2, tcpdump, nmap, kmod-mt7996 (WiFi firmware), USB storage
+
+== KNOWN BUILD QUIRKS ==
+1. Z8803BE sysupgrade image is NOT auto-produced by make — must use manual
+   sysupgrade-tar.sh assembly after build (see build script step 8)
+2. Strip /mnt/[c-z] from WSL PATH before make or build breaks
+3. Disable openwrt_one and abt_asr3000 in filogic.mk (missing BL31/uboot)
+4. Flash with: sysupgrade -n -F /tmp/rocket-firmware-E-vX.Y.Z.bin
+5. Router uses APK (not opkg) — it's SNAPSHOT not stable
+
+== DASHBOARD CGI ==
+File: D:\Rocket-Routers-Website\firmware-build\rocket-dashboard.cgi
+Staged to: files/www/cgi-bin/rocket (no .cgi extension on router)
+Size: ~1.1MB, ~15,200 lines (after Phase 6 patch)
+Language: busybox ash backend + vanilla JS frontend
+CRITICAL: ALWAYS use Python to edit this file — Edit tool truncates large files
+
+== PHASES COMPLETE IN DASHBOARD ==
+Phase 1: Basic network info display
+Phase 2: Network setup wizard (guest WiFi)
+Phase 3: WAN2 setup wizard
+Phase 4: Port roles / pictogram
+Phase 5: mwan3 failover/load-balance wizard + pictogram mwan3 status
+Phase 6: QModem dual-modem support + WiFi setup card (ALL DONE — NOT YET IN A FIRMWARE BUILD)
+
+== PHASE 6 CHANGES (in rocket-dashboard.cgi, waiting for v3.9.1 build) ==
+6A — hw_discover now returns:
+  - active_wan_dev: kernel device carrying default route (e.g. "usb1")
+  - qmodem: [{iface, dev, metric},...] — sorted by metric, from UCI modem_config
+  - wifi: {ssid, bands} — current SSID + number of AP interfaces
+  Pictogram fix: picks first UP modem instead of modems[0] (usb0 had no SIM)
+  Second modem box shown in pictogram when 2 modems present
+
+6B — net_wizard_wifi backend handler:
+  GET (no body): returns {ok, ssid, key, bands}
+  POST ssid=...&key=...: sets SSID+key on all AP wifi-iface sections,
+    removes disabled flag from all wifi-device sections, runs wifi reload
+  Frontend: WiFi card in network wizard (My Network tab), collapsible
+    Change/Close toggle, SSID + password inputs, Apply button
+
+6C — net_wizard_mwan3 rewritten:
+  Detects QModem interfaces via UCI modem_config attribute
+  Sorts by metric (lowest = primary WAN)
+  Creates dynamic mwan3 interface sections + members (rr_qm1_w3, rr_qm2_w2,
+    rr_qm2_w3) for QModem path
+  Falls back to classic wan/wanb path for ethernet WAN2
+  showMwan3 wizard card now appears when 2+ QModem interfaces present
+  (not just when a WAN2 ethernet port is configured)
+
+== MWAN3 CONFIG ON ROUTER ==
+Pre-built members already in firmware: wan_m1_w3, wanb_m1_w3, wanb_m2_w2
+Pre-built policies: balanced, wan_wanb (failover), wanb_wan, wan_only, wanb_only
+Dashboard creates: rr_lb (load balance), rr_fo (failover)
+QModem wizard creates members: rr_qm1_w3, rr_qm2_w2, rr_qm2_w3
+
+== QMODEM ON ROUTER ==
+QModem creates UCI interfaces with modem_config attribute e.g.:
+  network.4_1: device=usb1, metric=12, modem_config=...
+  network.4_2: device=usb0, metric=20, modem_config=...
+Default route goes via usb1 (metric 12), NOT via network.wan
+mwan3 must track 4_1 and 4_2, not wan/wanb
+
+== CURRENT BUILD VERSIONS ==
+v3.9.0: rocket-firmware-E-v3.9.0.bin (BUILT + FLASHED — on router now)
+  Phase 5: mwan3 wizard, dual-WAN failover/load-balance UI
+v3.9.1: NOT YET BUILT
+  Phase 6: dual-modem pictogram fix + WiFi card + QModem mwan3 wizard
+
+== TASK STATUS ==
+- Task #23: Build v3.9.1 firmware (NEXT TASK)
+  Script to create: build-v3.9.1.sh (copy build-v3.9.0.sh, bump version)
+  Metadata to create: rocket-vE-v3.9.1-metadata.config
+  CGI is ready at: D:\Rocket-Routers-Website\firmware-build\rocket-dashboard.cgi
+
+== FILES TO KNOW ==
+D:\Rocket-Routers-Website\firmware-build\
+  rocket-dashboard.cgi              ← THE main dashboard (edit with Python only)
+  rocket-vE.config                  ← package list for make defconfig
+  rocket-vE-v3.9.0-metadata.config  ← version strings (copy + edit for v3.9.1)
+  build-v3.9.0.sh                   ← full build script (copy + edit for v3.9.1)
+  BUILD_SOURCES.md                  ← detailed reference doc
+  99-rocket-mwan3                   ← first-boot mwan3 uci-defaults script
+  97-rocket-modem                   ← first-boot modem config script
+  98-rocket-wifi                    ← first-boot WiFi SSID/key setup script
+
+== QUICK COMMANDS ==
+# Build firmware (run from WSL)
+bash /mnt/d/Rocket-Routers-Website/firmware-build/build-v3.9.1.sh
+
+# SCP dashboard to running RocketPlus E (quick test without full rebuild)
+scp /mnt/d/Rocket-Routers-Website/firmware-build/rocket-dashboard.cgi \
+    root@192.168.1.1:/www/cgi-bin/rocket
+
+# SCP firmware to router then flash
+scp /mnt/d/Rocket-Routers-Website/firmware-build/rocket-firmware-E-v3.9.1.bin \
+    root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 "sysupgrade -n -F /tmp/rocket-firmware-E-v3.9.1.bin"
+
+== END OF CONTEXT ==

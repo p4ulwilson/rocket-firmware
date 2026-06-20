@@ -1,0 +1,380 @@
+#!/bin/sh
+# /etc/uci-defaults/99-rocket-mwan3
+# Mycelium Mesh RocketRouters - Auto-detecting failover/load-balance
+# Runs once on first boot. Detects modem count and configures mwan3 + tuning.
+#
+# Hardware matrix:
+#   1x Quectel (2c7c:0900)  -> Plus / Pro       : fibre primary, cell failover
+#   2x Quectel (2c7c:0900)  -> Plus/Pro Supreme : fibre primary, dual-cell load-balanced failover
+
+set -e
+
+LOGTAG="rocket-uci-defaults"
+logger -t "$LOGTAG" "v2.5.5 first-boot configuration starting"
+
+# ---------------------------------------------------------------------------
+# 1. Detect modem count (wait up to 60s for USB to settle)
+#
+# v3.11.6 fix: was 30s AND broke out the instant ANY modem appeared. Live
+# logread on a physical dual-modem (Supreme) unit showed qmodem doesn't
+# finish recognising/dialling the second RM500U-EA until ~100-155s after
+# boot — but that is qmodem's own slow AT-probe/dial sequence, not raw USB
+# enumeration (which lsusb reads directly from the kernel and is normally
+# much faster). The original code's real bug was breaking out on
+# MODEM_COUNT=1 immediately rather than giving a second device a chance to
+# show up at all — so rocket-routers-profile was always "rocket-single" on
+# Supreme units even when both modems were physically present, and the
+# v3.11.4 wwan2/dual-WAN rework never got a chance to activate.
+#
+# Fix: only break out immediately when 2 modems are seen (confirmed dual
+# hardware, fast path — no added delay for genuine Supreme units once both
+# enumerate). If only 1 (or 0) is seen, keep polling up to the full 60s
+# window before finalising, instead of accepting the first count we see.
+# This does add a fixed ~60s to first boot on single-modem (Plus/Pro)
+# units — a one-time cost, accepted in exchange for the dual-WAN feature
+# actually working on Supreme units. If 60s still isn't enough on some
+# units, this is the first place to extend further.
+# ---------------------------------------------------------------------------
+i=0
+MODEM_COUNT=0
+# NOTE: use `grep | wc -l` not `grep -c`. grep -c exits 1 on zero matches,
+# which trips `set -e` and kills the script before USB enumeration finishes
+# on a slow first boot. wc -l always returns 0.
+while [ $i -lt 60 ]; do
+    MODEM_COUNT=$(lsusb 2>/dev/null | grep '2c7c:0900' | wc -l)
+    MODEM_COUNT=${MODEM_COUNT:-0}
+    [ "$MODEM_COUNT" -ge 2 ] && break
+    sleep 1
+    i=$((i+1))
+done
+
+logger -t "$LOGTAG" "Detected $MODEM_COUNT Quectel modem(s)"
+
+case "$MODEM_COUNT" in
+    0) HW_PROFILE="rocket-no-modem" ;;
+    1) HW_PROFILE="rocket-single"   ;;
+    2) HW_PROFILE="rocket-supreme"  ;;
+    *) HW_PROFILE="rocket-multi"    ;;
+esac
+echo "$HW_PROFILE" > /etc/rocket-routers-profile
+
+# ---------------------------------------------------------------------------
+# 2. Kernel & conntrack tuning (applies to all profiles)
+# ---------------------------------------------------------------------------
+cat > /etc/sysctl.d/99-rocket-tuning.conf <<'EOF'
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+net.netfilter.nf_conntrack_buckets = 65536
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+
+mkdir -p /etc/modprobe.d
+echo "options nf_conntrack hashsize=65536" > /etc/modprobe.d/nf_conntrack.conf
+
+cat > /etc/init.d/rocket-cpufreq <<'EOF'
+#!/bin/sh /etc/rc.common
+START=98
+start() {
+    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -w "$g" ] && echo performance > "$g"
+    done
+}
+EOF
+chmod +x /etc/init.d/rocket-cpufreq
+/etc/init.d/rocket-cpufreq enable
+
+# ---------------------------------------------------------------------------
+# 3. Software flow offloading
+# ---------------------------------------------------------------------------
+uci set firewall.@defaults[0].flow_offloading='0'
+uci set firewall.@defaults[0].flow_offloading_hw='0'
+uci commit firewall
+
+# ---------------------------------------------------------------------------
+# 4. Bail out gracefully if no modem at all
+# ---------------------------------------------------------------------------
+if [ "$MODEM_COUNT" -eq 0 ]; then
+    logger -t "$LOGTAG" "No Quectel modem detected - leaving fibre-only config"
+    echo "Mycelium Mesh RocketRouters v__ROCKET_FW_VERSION__ (fibre-only mode)" > /etc/rocket-routers-version
+    date -u +"Built: %Y-%m-%dT%H:%M:%SZ" >> /etc/rocket-routers-version
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 4b. Variant gate - mwan3 only runs on Pro / Supreme firmware variants.
+# The Plus tier ships cell-only by default; mwan3 would blackhole traffic
+# until fibre is plugged in. Customers add their fibre uplink in LuCI later
+# and can enable mwan3 manually, OR flash the Pro tier build, which sets
+# this flag at build time.
+#
+# To enable: in OpenWrt build, drop /etc/rocket-mwan3-enable into firmware
+# files/ tree - presence of file activates load-balance/failover.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4c. Topology C gate - SFP+ trunk mode, cell-only WAN, no mwan3
+# ---------------------------------------------------------------------------
+if grep -q "Topology C" /etc/rocket-firmware-variant 2>/dev/null; then
+    logger -t "$LOGTAG" "Topology C detected - SFP+ trunk mode, skipping mwan3"
+    echo "Mycelium Mesh RocketRouters v__ROCKET_FW_VERSION__ (SFP+ trunk mode)" > /etc/rocket-routers-version
+    date -u +"Built: %Y-%m-%dT%H:%M:%SZ" >> /etc/rocket-routers-version
+    /etc/init.d/mwan3 disable 2>/dev/null
+    /etc/init.d/mwan3 stop 2>/dev/null
+    exit 0
+fi
+if [ ! -f /etc/rocket-mwan3-enable ]; then
+    logger -t "$LOGTAG" "mwan3 gate not set - skipping (cell-only mode)"
+    echo "Mycelium Mesh RocketRouters v__ROCKET_FW_VERSION__ (cell-only mode)" > /etc/rocket-routers-version
+    date -u +"Built: %Y-%m-%dT%H:%M:%SZ" >> /etc/rocket-routers-version
+    /etc/init.d/mwan3 disable 2>/dev/null
+    /etc/init.d/mwan3 stop 2>/dev/null
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 5. mwan3 - common scaffolding
+# ---------------------------------------------------------------------------
+PROBE4='1.1.1.1 8.8.8.8 9.9.9.9'
+PROBE6='2606:4700:4700::1111 2001:4860:4860::8888 2620:fe::fe'
+
+> /etc/config/mwan3
+touch /etc/config/mwan3
+
+mwan3_iface() {
+    local name="$1" family="$2" metric="$3"
+    uci set mwan3.${name}=interface
+    uci set mwan3.${name}.enabled='1'
+    uci set mwan3.${name}.family="$family"
+    uci set mwan3.${name}.reliability='2'
+    uci set mwan3.${name}.count='1'
+    uci set mwan3.${name}.timeout='3'
+    uci set mwan3.${name}.interval='5'
+    uci set mwan3.${name}.down='3'
+    uci set mwan3.${name}.up='5'
+    uci set mwan3.${name}.flush_conntrack='connected disconnected'
+    uci set mwan3.${name}.metric="$metric"
+    if [ "$family" = "ipv4" ]; then
+        for t in $PROBE4; do uci add_list mwan3.${name}.track_ip="$t"; done
+    else
+        for t in $PROBE6; do uci add_list mwan3.${name}.track_ip="$t"; done
+    fi
+}
+
+mwan3_member() {
+    local name="$1" iface="$2" metric="$3" weight="$4"
+    uci set mwan3.${name}=member
+    uci set mwan3.${name}.interface="$iface"
+    uci set mwan3.${name}.metric="$metric"
+    uci set mwan3.${name}.weight="$weight"
+}
+
+# ---------------------------------------------------------------------------
+# 6. Profile-specific configuration
+# ---------------------------------------------------------------------------
+if [ "$MODEM_COUNT" -eq 1 ]; then
+    logger -t "$LOGTAG" "Configuring single-modem failover profile"
+
+    mwan3_iface wan      ipv4 1
+    mwan3_iface wan6     ipv6 1
+    mwan3_iface wwan     ipv4 2
+    mwan3_iface wwan_6   ipv6 2
+
+    mwan3_member wan_m1     wan    1 3
+    mwan3_member wan6_m1    wan6   1 3
+    mwan3_member wwan_m2    wwan   2 3
+    mwan3_member wwan6_m2   wwan_6 2 3
+
+    # NOTE: mwan3 policy names must be <=15 chars - they get used to build
+    # iptables chain names ("mwan3_policy_<name>"), which have a hard 29-char
+    # limit. "fibre_then_cell6" (16 chars) used to silently fail here -
+    # mwan3-init would log "exceeds max of 15 chars. Not setting policy" and
+    # skip creating the chain entirely, leaving failover non-functional.
+    uci set mwan3.wan_cell=policy
+    uci add_list mwan3.wan_cell.use_member='wan_m1'
+    uci add_list mwan3.wan_cell.use_member='wwan_m2'
+    uci set mwan3.wan_cell.last_resort='unreachable'
+
+    uci set mwan3.wan_cell6=policy
+    uci add_list mwan3.wan_cell6.use_member='wan6_m1'
+    uci add_list mwan3.wan_cell6.use_member='wwan6_m2'
+    uci set mwan3.wan_cell6.last_resort='unreachable'
+
+    uci set mwan3.default_v4=rule
+    uci set mwan3.default_v4.dest_ip='0.0.0.0/0'
+    uci set mwan3.default_v4.family='ipv4'
+    uci set mwan3.default_v4.use_policy='wan_cell'
+
+    uci set mwan3.default_v6=rule
+    uci set mwan3.default_v6.dest_ip='::/0'
+    uci set mwan3.default_v6.family='ipv6'
+    uci set mwan3.default_v6.use_policy='wan_cell6'
+
+    PROFILE_LABEL="Single-modem failover"
+
+else
+    logger -t "$LOGTAG" "Configuring dual-modem load-balanced failover profile"
+
+    # v3.11.4 fix: wwan2 previously used proto=modemmanager, which can never
+    # come up - 97-rocket-modem explicitly stops/disables ModemManager
+    # ("Q-modem handles everything" - see step 3 there). Confirmed live via
+    # ubus call network.interface.wwan2 status -> {"errors":[{"code":"NO_DEVICE"}]}
+    # on every boot on every Supreme unit. The second modem's internet was
+    # only ever working because qmodem auto-created its own untracked
+    # interface ("4_1") outside of mwan3 entirely - so dual-WAN failover was
+    # NEVER functional on shipped dual-modem units, even after the policy
+    # name fix above.
+    #
+    # Fix: configure wwan2 as a real dhcp interface on usb1, mirroring
+    # exactly how 97-rocket-modem configures the primary modem (wwan/usb0).
+    # Q-modem (qmodem) already handles AT/dialing for both modem slots
+    # (qmodem.2_1 -> usb0, qmodem.4_1 -> usb1 - verified live); the network
+    # side just needs a plain DHCP client, same as wwan.
+    # v3.11.7 fix: this script runs with `set -e` (line 10). `uci -q delete`
+    # of a section that doesn't exist yet (true on every first boot, since
+    # network.wwan2 has never been created before) still exits 1 — the -q
+    # flag only suppresses the error message, not the exit code. Under
+    # set -e that silently killed the WHOLE script right here, before any
+    # mwan3_iface/member/policy or `uci commit mwan3` ran — which is why
+    # MODEM_COUNT correctly detected 2 and rocket-routers-profile correctly
+    # said "rocket-supreme", yet `uci show mwan3` came back completely
+    # empty and wwan2 was never created. `|| true` makes the "doesn't exist
+    # yet" case a non-fatal no-op, same as it already behaves in
+    # 97-rocket-modem (which has no `set -e` and was never affected).
+    # v3.11.12 fix: defaultroute/peerdns were never set here either (same bug
+    # as wwan in 97-rocket-modem). mwan3 needs full ownership of routing —
+    # without this, whichever modem's DHCP client last renewed a lease wins
+    # the one default-route slot in the main routing table, regardless of
+    # which modem mwan3 itself considers online. Confirmed live: wwan2/usb1
+    # (a dead modem) held the only default route while wwan/usb0 (the modem
+    # mwan3 called online) didn't — exactly the "interface up, ping still
+    # dead" symptom Paul hit.
+    uci -q delete network.wwan2 2>/dev/null || true
+    uci set network.wwan2=interface
+    uci set network.wwan2.proto='dhcp'
+    uci set network.wwan2.device='usb1'
+    uci set network.wwan2.defaultroute='0'
+    uci set network.wwan2.peerdns='0'
+    uci commit network
+
+    # Auto-connect wwan2 when usb1 appears (mirrors 97-rocket-modem's
+    # 30-wwan-up fix for usb0 - netifd starts before the USB modem
+    # enumerates, so it misses usb1 on boot without this).
+    mkdir -p /etc/hotplug.d/net
+    cat > /etc/hotplug.d/net/31-wwan2-up <<'NETHOTPLUG2'
+#!/bin/sh
+# Rocket Routers v3.11.4 — Auto-connect wwan2 when usb1 appears
+[ "$ACTION" = "add" ] && [ "$INTERFACE" = "usb1" ] && {
+    logger -t "rocket-wwan2" "usb1 appeared — running ifup wwan2"
+    ifup wwan2
+}
+NETHOTPLUG2
+    chmod +x /etc/hotplug.d/net/31-wwan2-up
+
+    # Add wwan2 to the WAN firewall zone (masq/forwarding) - this was never
+    # done for the old modemmanager wwan2 either, since it never came up to
+    # expose the gap. Find the WAN zone by name, same approach as
+    # 97-rocket-modem uses for wwan.
+    # Same set -e trap as above: once $i runs past the last zone that
+    # actually exists, `uci get` returns 1 (no such section) and would kill
+    # the script here too. `|| true` keeps ZONE_NAME2 empty instead of
+    # aborting, so the loop can keep checking the rest of the range.
+    WAN_ZONE_IDX2=""
+    for i in $(seq 0 9); do
+        ZONE_NAME2=$(uci -q get firewall.@zone[$i].name 2>/dev/null) || true
+        if [ "$ZONE_NAME2" = "wan" ]; then WAN_ZONE_IDX2=$i; break; fi
+    done
+    if [ -n "$WAN_ZONE_IDX2" ]; then
+        if ! uci -q get firewall.@zone[$WAN_ZONE_IDX2].network | grep -q wwan2; then
+            uci -q add_list firewall.@zone[$WAN_ZONE_IDX2].network='wwan2'
+        fi
+        uci -q commit firewall
+    fi
+
+    mwan3_iface wan      ipv4 1
+    mwan3_iface wan6     ipv6 1
+    mwan3_iface wwan     ipv4 2
+    mwan3_iface wwan_6   ipv6 2
+    mwan3_iface wwan2    ipv4 2
+    mwan3_iface wwan2_6  ipv6 2
+
+    mwan3_member wan_m1      wan     1 3
+    mwan3_member wan6_m1     wan6    1 3
+    mwan3_member wwan_m2     wwan    2 3
+    mwan3_member wwan2_m2    wwan2   2 3
+    mwan3_member wwan6_m2    wwan_6  2 3
+    mwan3_member wwan2_6_m2  wwan2_6 2 3
+
+    # See <=15 char note above - "fibre_then_cells"/"fibre_then_cells6"
+    # (16/17 chars) were the ones actually caught failing in the field on
+    # the Supreme dual-modem profile: mwan3-init skipped the policy, and
+    # iptables-restore errored "chain name too long", leaving failover dead.
+    uci set mwan3.wan_cells=policy
+    uci add_list mwan3.wan_cells.use_member='wan_m1'
+    uci add_list mwan3.wan_cells.use_member='wwan_m2'
+    uci add_list mwan3.wan_cells.use_member='wwan2_m2'
+    uci set mwan3.wan_cells.last_resort='unreachable'
+
+    uci set mwan3.wan_cells6=policy
+    uci add_list mwan3.wan_cells6.use_member='wan6_m1'
+    uci add_list mwan3.wan_cells6.use_member='wwan6_m2'
+    uci add_list mwan3.wan_cells6.use_member='wwan2_6_m2'
+    uci set mwan3.wan_cells6.last_resort='unreachable'
+
+    uci set mwan3.default_v4=rule
+    uci set mwan3.default_v4.dest_ip='0.0.0.0/0'
+    uci set mwan3.default_v4.family='ipv4'
+    uci set mwan3.default_v4.use_policy='wan_cells'
+
+    uci set mwan3.default_v6=rule
+    uci set mwan3.default_v6.dest_ip='::/0'
+    uci set mwan3.default_v6.family='ipv6'
+    uci set mwan3.default_v6.use_policy='wan_cells6'
+
+    PROFILE_LABEL="Dual-modem load-balanced failover (Supreme)"
+fi
+
+uci commit mwan3
+
+# ---------------------------------------------------------------------------
+# 7. SQM cake on cell interfaces
+# ---------------------------------------------------------------------------
+sqm_apply() {
+    local iface="$1" idx="$2"
+    uci set sqm.${idx}=queue
+    uci set sqm.${idx}.interface="$iface"
+    # v3.11.4 fix: default Cake to OFF. It was previously enabled='1' out of
+    # the box on every WAN/cell leg with download/upload left at 0 (unlimited
+    # placeholder), which silently throttled or misbehaved on lines the
+    # customer never asked to shape. Cake should be an opt-in the customer or
+    # installer turns on from the dashboard (cake_set in rocket-dashboard.cgi)
+    # once real download/upload numbers are known, not a hidden default.
+    uci set sqm.${idx}.enabled='0'
+    uci set sqm.${idx}.qdisc='cake'
+    uci set sqm.${idx}.script='piece_of_cake.qos'
+    uci set sqm.${idx}.linklayer='ethernet'
+    uci set sqm.${idx}.overhead='44'
+    uci set sqm.${idx}.download='0'
+    uci set sqm.${idx}.upload='0'
+}
+
+> /etc/config/sqm
+touch /etc/config/sqm
+# Fibre is always a real concurrent mwan3 member whenever this section is
+# reached (mwan3-enable gate already passed above), so it always gets a
+# queue too — not just the cell legs. Numbers stay 0/dynamic; the dashboard
+# speed test sets real values per-customer, never hardcoded here.
+sqm_apply wan fibre
+sqm_apply wwan cell_a
+[ "$MODEM_COUNT" -ge 2 ] && sqm_apply wwan2 cell_b
+uci commit sqm
+
+# ---------------------------------------------------------------------------
+# 8. Version stamp
+# ---------------------------------------------------------------------------
+{
+    echo "Mycelium Mesh RocketRouters v__ROCKET_FW_VERSION__"
+    ec

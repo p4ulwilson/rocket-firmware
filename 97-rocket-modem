@@ -1,0 +1,283 @@
+#!/bin/sh
+# /etc/uci-defaults/97-rocket-modem
+# Mycelium Mesh RocketRouters - Cellular modem auto-configuration
+# Configures Quectel RM500U-EA for: NCM mode, explicit APN (three.co.uk),
+# Q-modem dialing, DHCP on usb0, firewall WAN zone, GPIO power persistence.
+# ModemManager is disabled - Q-modem owns AT port and dials.
+#
+# v2.5.5 fix: lock qmodem at_port to /dev/ttyUSB2 (the only working AT port
+# on RM500U-EA - ttyUSB3 echoes 'AT' but never responds, causing empty
+# Cellular Network status panel). Verified via:
+#   ubus call at-daemon sendat '{"at_port":"/dev/ttyUSB2","command":"AT+CSQ"}'
+#
+# v3.2.0 fix: PERMANENT APN FIX.
+# autoapn=1 is KEPT (works with standard carrier SIMs, plug-and-play).
+# Smarty/Three UK is an MVNO — autoapn fails silently (SIM has no APN in
+# service table). Fix: set AT+CGDCONT=1,"IPV4V6","three.co.uk" ALONGSIDE
+# autoapn so Three/Smarty always has a fallback APN. Also deploys
+# /etc/hotplug.d/usb/20-quectel-smarty-apn which re-applies three.co.uk
+# on every USB connect event (modem power cycle, cfun reset, USB glitch).
+# This means the APN is correct on EVERY boot, not just the first one.
+# Package manager: APK (not opkg — this firmware uses pttuan's custom branch).
+
+LOGTAG="rocket-modem-defaults"
+logger -t "$LOGTAG" "v3.2.0 Modem auto-configuration starting"
+
+# ---------------------------------------------------------------------------
+# 1. GPIO power-on persistence (modem powered via GPIO 4g/4g2)
+#
+# v3.11.10 fix (REVISED in v3.11.12 — see below): REAL power-cycle pulse,
+# not just "assert high". Every version through v3.11.9 only ever did
+# `echo 1 > value` here — on a WARM reset (watchdog trigger, sysupgrade's
+# soft reboot, or a manual `reboot`) the GPIO line may already be sitting
+# at 1 from before, so that write is a no-op and the modem never actually
+# loses power. If a modem ends up wedged, nothing about a warm reboot ever
+# clears it. Matches what was observed on a physical unit: bootloops
+# forever until a full mains unplug, then boots clean every time after.
+#
+# v3.11.12 fix: v3.11.10's full low->high pulse in rc.local ran on EVERY
+# single boot, not just first boot — meaning every warm reboot now forces
+# both 5G modems through a genuine cold power-on, baseband and all. A
+# Quectel RM500U-EA cold-booting its baseband from a dead stop can easily
+# take 60-120+ seconds to fully attach, and with TWO modems doing this
+# every boot, that lines up almost exactly with the new failure mode
+# observed live: ~11s of normal boot, then ~120s sitting solid red, then
+# a watchdog reset — a hang duration that didn't exist before this fix and
+# is suspiciously close to realistic 5G-module cold-boot time. Likely:
+# the v3.11.10 fix traded an occasional first-boot/post-flash wedge for a
+# near-guaranteed long hang on EVERY warm boot.
+# NOT YET CONFIRMED either — best-evidenced theory so far, same caveat as
+# v3.11.10's original note.
+# Fix: rc.local goes back to a plain, fast assert-HIGH on every ordinary
+# boot (matches every version before v3.11.10 — known NOT to cause this
+# new ~120s-hang failure mode). The real low->high power-cycle pulse stays
+# ONLY in the first-boot inline block below (where it's genuinely needed,
+# right after a fresh flash, to clear out a modem state that may have
+# carried over wedged from before sysupgrade). Ordinary warm reboots no
+# longer force a full modem cold-boot.
+# ---------------------------------------------------------------------------
+cat > /etc/rc.local <<'RC'
+#!/bin/sh
+# Rocket Routers - ensure internal 5G modem GPIO is powered at boot.
+# v3.11.12: back to plain assert-HIGH (fast, no-op if already on) — see
+# v3.11.12 note above in 97-rocket-modem for why the full low->high pulse
+# was reverted to first-boot-only.
+echo 1 > /sys/class/gpio/4g/value 2>/dev/null
+echo 1 > /sys/class/gpio/4g2/value 2>/dev/null
+exit 0
+RC
+chmod +x /etc/rc.local
+
+# Power-cycle modem now (first boot) — same real low->high pulse
+echo 0 > /sys/class/gpio/4g/value 2>/dev/null
+echo 0 > /sys/class/gpio/4g2/value 2>/dev/null
+sleep 2
+echo 1 > /sys/class/gpio/4g/value 2>/dev/null
+echo 1 > /sys/class/gpio/4g2/value 2>/dev/null
+sleep 12
+
+# ---------------------------------------------------------------------------
+# 2. Modem AT configuration (NCM mode + autoapn + explicit APN fallback)
+#
+# v3.11.5 fix: BACKGROUNDED — see reboot-loop notes below. This block was
+# previously foreground/blocking, with up to ~60s of worst-case retry sleeps
+# (usbnet set: 5x5s, CGDCONT: 5x5s). uci-defaults scripts run once, serially,
+# on first boot only; 99-rocket-mwan3 (which runs after this script) adds its
+# own ~30s modem-count detection wait on top of that. Combined, first boot on
+# a dual-modem unit could spend 60-90+ continuous seconds in this foreground
+# path — well past the mtk-wdt hardware watchdog's 31-second timeout
+# (confirmed live via dmesg: "Watchdog enabled (timeout=31 sec, nowayout=0)").
+# This is the leading theory for the first-boot-only reboot loop observed on
+# physical units: a hardware watchdog reset mid-script, before anything is
+# flushed to log (consistent with zero kernel oops/panic in logread, empty
+# /sys/fs/pstore, and a different LED failure point on each attempt).
+#
+# Fix: run the whole AT-retry sequence in a backgrounded subshell so this
+# script returns immediately and the remaining first-boot steps (3-9, all
+# fast uci/file operations, no sleeps) finish well inside the watchdog
+# window. The AT configuration still runs to completion and still logs its
+# own progress/success via logger — it just no longer blocks the boot-critical
+# path. Mirrors the existing non-blocking pattern already used in
+# 92-rocket-pin-modem and the step-8 APN hotplug script below.
+#
+# autoapn=1 is KEPT — the firmware is designed to work plug-and-play with any
+# SIM. autoapn auto-detects the APN for most UK and global carriers.
+#
+# For Smarty/Three UK (MVNO): autoapn fails silently because Smarty SIMs do
+# not carry the APN in the service table. The explicit AT+CGDCONT below sets
+# three.co.uk as a safety net alongside autoapn. For non-Three SIMs, autoapn
+# takes over and the CGDCONT value is overridden by the modem.
+#
+# AT+CGDCONT values are runtime-only on RM500U-EA — they do NOT persist
+# across USB re-enumeration or AT+CFUN resets. The hotplug script in step 8
+# re-applies three.co.uk on every USB connect event (permanent fix).
+# ---------------------------------------------------------------------------
+(
+if [ -e /dev/ttyUSB2 ]; then
+    # NCM mode (usbnet=5) — verified working on Z8803BE.
+    # Do NOT switch to QMI (usbnet=0) without confirming cdc-wdm0 appears
+    # and kmod-usb-net-qmi-wwan is in the build.
+    # Retry loop: modem may not accept AT commands immediately after power-on
+    for attempt in 1 2 3 4 5; do
+        sms_tool -d /dev/ttyUSB2 at 'AT+QCFG="usbnet",5' >/dev/null 2>&1 && break
+        logger -t "$LOGTAG" "usbnet set attempt $attempt failed — retrying in 5s"
+        sleep 5
+    done
+    sleep 2
+
+    # Keep autoapn enabled — works with standard carrier SIMs automatically
+    sms_tool -d /dev/ttyUSB2 at 'AT+QCFG="autoapn",1' >/dev/null 2>&1
+
+    # Also set three.co.uk explicitly as fallback for Smarty/Three UK (MVNO)
+    # On Three SIMs: autoapn fails → this setting is used
+    # On other SIMs: autoapn succeeds → modem uses auto-detected APN instead
+    # Retry loop: AT+CGDCONT error 1 = modem not ready yet
+    for attempt in 1 2 3 4 5; do
+        sms_tool -d /dev/ttyUSB2 at 'AT+CGDCONT=1,"IPV4V6","three.co.uk"' >/dev/null 2>&1
+        RET=$?
+        if [ $RET -eq 0 ]; then
+            logger -t "$LOGTAG" "APN set: three.co.uk (attempt $attempt)"
+            break
+        fi
+        logger -t "$LOGTAG" "APN attempt $attempt failed (error $RET) — retrying in 5s"
+        sleep 5
+    done
+
+    # ---------------------------------------------------------------------------
+    # Band preference: Three UK / Smarty optimisation
+    #
+    # Problem: RM500U-EA in 5G NSA mode latches onto Band 1 (2100MHz) as the
+    # LTE anchor even when SINR is poor (< 0dB), causing 300-2000ms latency.
+    # Band 20 (800MHz) has far better range and wall penetration and is used
+    # by Three UK as both an LTE band and a 5G NSA LTE anchor.
+    #
+    # Fix: allow all Three UK LTE bands (1, 3, 20, 28) so the modem can pick
+    # the best anchor based on actual signal quality. Keep mode_pref AUTO so
+    # the modem still uses 5G NSA when signal conditions are good.
+    #
+    # Result: modem self-selects Band 20 in poor/indoor conditions (50-60ms),
+    # and Band 1 + NR N78 in good outdoor conditions (5G NSA full speed).
+    # ---------------------------------------------------------------------------
+    sms_tool -d /dev/ttyUSB2 at 'AT+QNWPREFCFG="mode_pref",AUTO' >/dev/null 2>&1
+    sms_tool -d /dev/ttyUSB2 at 'AT+QNWPREFCFG="lte_band",1:3:20:28' >/dev/null 2>&1
+    logger -t "$LOGTAG" "Band preference: AUTO mode, LTE bands 1/3/20/28 (Three UK)"
+
+    logger -t "$LOGTAG" "Modem: NCM mode, autoapn=1, APN fallback=three.co.uk, bands optimised"
+else
+    logger -t "$LOGTAG" "WARNING: /dev/ttyUSB2 not found — modem AT config skipped"
+fi
+) &
+
+# ---------------------------------------------------------------------------
+# 3. Disable ModemManager (Q-modem handles everything)
+# ---------------------------------------------------------------------------
+/etc/init.d/modemmanager stop >/dev/null 2>&1 || true
+/etc/init.d/modemmanager disable >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 4. Q-modem defmodems entry (LuCI Modems page display)
+# Schema must match modemdefine.js: section type 'defmodems' with fields
+# modem / modemdata / comm_port / comm_serial / network / user_desc.
+# ---------------------------------------------------------------------------
+uci -q delete defmodems.@defmodems[0] 2>/dev/null
+uci -q delete defmodems.@modem[0] 2>/dev/null
+uci -q batch <<EOF
+add defmodems defmodems
+set defmodems.@defmodems[-1].modem='Quectel RM500U-EA'
+set defmodems.@defmodems[-1].modemdata='serial'
+set defmodems.@defmodems[-1].comm_port='/dev/ttyUSB2'
+set defmodems.@defmodems[-1].comm_serial='/dev/ttyUSB2'
+set defmodems.@defmodems[-1].network='wwan'
+set defmodems.@defmodems[-1].user_desc='Internal 5G'
+commit defmodems
+EOF
+
+# ---------------------------------------------------------------------------
+# 5. Network: wwan interface as DHCP on usb0 (Q-modem dials, kernel gets IP)
+#
+# v3.11.12 fix: defaultroute/peerdns were never set here. mwan3 needs full
+# ownership of routing — every WAN-type interface must have its own DHCP
+# client kept OUT of the main routing table (defaultroute='0') and out of
+# /etc/resolv.conf (peerdns='0'), otherwise whichever modem's DHCP client
+# last renewed wins the one slot in the main table, regardless of whether
+# mwan3 actually considers it online. Confirmed live: `ip route show` had
+# the only default route pointing at the modem mwan3 called OFFLINE, while
+# the modem mwan3 called online wasn't the default route at all — explains
+# "interface up, ping still dead" exactly. Real client/LAN traffic is
+# supposed to go through mwan3's own per-policy tables regardless; this
+# stops the main table from fighting that.
+# ---------------------------------------------------------------------------
+uci -q delete network.wwan 2>/dev/null
+uci -q batch <<EOF
+set network.wwan=interface
+set network.wwan.proto='dhcp'
+set network.wwan.device='usb0'
+set network.wwan.defaultroute='0'
+set network.wwan.peerdns='0'
+commit network
+EOF
+
+# ---------------------------------------------------------------------------
+# 6. Firewall: add wwan (usb0) to WAN zone
+#
+# v3.2.0 fix: do NOT use @zone[1] — the index depends on zone order and
+# breaks if other scripts add zones before this one runs. Find the WAN zone
+# by name instead. Also ensure masq=1 and mtu_fix=1 are set on the zone.
+# ---------------------------------------------------------------------------
+WAN_ZONE_IDX=""
+for i in $(seq 0 9); do
+    ZONE_NAME=$(uci -q get firewall.@zone[$i].name 2>/dev/null)
+    if [ "$ZONE_NAME" = "wan" ]; then
+        WAN_ZONE_IDX=$i
+        break
+    fi
+done
+
+if [ -n "$WAN_ZONE_IDX" ]; then
+    if ! uci -q get firewall.@zone[$WAN_ZONE_IDX].network | grep -q wwan; then
+        uci -q add_list firewall.@zone[$WAN_ZONE_IDX].network='wwan'
+        logger -t "$LOGTAG" "Added wwan to firewall WAN zone (index $WAN_ZONE_IDX)"
+    fi
+    uci -q set firewall.@zone[$WAN_ZONE_IDX].masq='1'
+    uci -q set firewall.@zone[$WAN_ZONE_IDX].mtu_fix='1'
+    uci -q commit firewall
+else
+    logger -t "$LOGTAG" "WARNING: WAN zone not found by name — creating fallback zone"
+    uci -q batch <<EOF
+add firewall zone
+set firewall.@zone[-1].name='wan'
+set firewall.@zone[-1].input='REJECT'
+set firewall.@zone[-1].output='ACCEPT'
+set firewall.@zone[-1].forward='REJECT'
+set firewall.@zone[-1].masq='1'
+set firewall.@zone[-1].mtu_fix='1'
+add_list firewall.@zone[-1].network='wwan'
+commit firewall
+EOF
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Lock qmodem at_port to /dev/ttyUSB2 (v2.5.5 fix)
+# Q-modem auto-detect picks ttyUSB3 on RM500U-EA, which is dead (echoes AT
+# but never responds). This empties the Status > Cellular Network panel and
+# causes qmodem_monitor to crash. Force the working port at first boot.
+# ---------------------------------------------------------------------------
+if [ -f /etc/config/qmodem ]; then
+    # qmodem section type on Z8803BE is 'modem-device' (NOT 'modem-slot').
+    # Section name is hardware-path-derived (4_1 on Z8803BE = USB bus 4 dev 1).
+    # Iterate all modem-device sections and pin at_port + valid_at_ports to
+    # /dev/ttyUSB2 (the only working AT port - ttyUSB3 echoes 'AT' but never
+    # responds, which empties the Status > Cellular Network panel).
+    for SECT in $(uci -q show qmodem | awk -F'[.=]' '/=modem-device$/{print $2}'); do
+        uci -q set qmodem.${SECT}.at_port='/dev/ttyUSB2'
+        uci -q set qmodem.${SECT}.valid_at_ports='/dev/ttyUSB2'
+        logger -t "$LOGTAG" "Pinned qmodem.${SECT}.at_port = /dev/ttyUSB2"
+    done
+    uci -q commit qmodem
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Deploy APN hotplug script (v3.2.0 permanent APN fix)
+#
+# AT+CGDCONT is runtime-only on the RM500U-EA. It is LOST on every USB
+# re-enumeration, AT+CFUN reset, or modem pow
